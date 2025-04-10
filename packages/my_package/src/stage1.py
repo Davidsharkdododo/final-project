@@ -50,9 +50,17 @@ class LaneControllerNode(DTROS):
             "red": (np.array([0, 70, 150]), np.array([10, 255, 255]))
         }
         
-        # Flag to ensure a single stop action.
+        # Flags and counters.
         self.red_line_stopped = False
-
+        self.red_line_count = 0  # Count the number of red line detections.
+        
+        # Dot detection setup.
+        self.circlepattern_dims = (7, 3)
+        blob_params = cv2.SimpleBlobDetector_Params()
+        blob_params.minArea = 10
+        blob_params.minDistBetweenBlobs = 2
+        self.simple_blob_detector = cv2.SimpleBlobDetector_create(blob_params)
+        
         # Initialize CvBridge.
         self.bridge = CvBridge()
         
@@ -137,7 +145,7 @@ class LaneControllerNode(DTROS):
                 normalized_weights = [base_weights[i] / total_weight for i in filtered_detections]
                 weighted_offsets = [filtered_offsets[i] * normalized_weights[i] for i in range(len(filtered_offsets))]
                 error_raw = sum(weighted_offsets)
-                error = error_raw * 0.01 - 1.25
+                error = error_raw * 0.01 - 1.3
             
             color = (0, 0, 255) if len(valid_detections) < 3 else (0, 255, 0)
             cv2.putText(bottom_half_out, f"{len(valid_detections)}/5 pts, err:{error:.3f}", 
@@ -224,7 +232,30 @@ class LaneControllerNode(DTROS):
         cmd_msg.vel_left = 0.0
         cmd_msg.vel_right = 0.0
         self._publisher.publish(cmd_msg)
-    
+        
+    def perform_left_turn(self):
+        """
+        Execute a left turn of 90 degrees with a turning radius of 50 cm.
+        For a turning radius R = 0.5 m and a chosen linear speed (e.g. 0.3 m/s),
+        the angular velocity omega = 0.3 / 0.5 = 0.6 rad/s.
+        A 90° turn requires an angle of pi/2 ≈ 1.57 rad, so the turn duration is:
+              t = 1.57 / 0.6 ≈ 2.62 seconds.
+        """
+        turn_duration = 4  # seconds
+        start_time = rospy.Time.now().to_sec()
+        rate = rospy.Rate(10)  # 10 Hz
+        rospy.loginfo("Turning left 90 degrees with 50cm radius; duration: %.2f sec", turn_duration)
+        while rospy.Time.now().to_sec() - start_time < turn_duration and not rospy.is_shutdown():
+            cmd_msg = WheelsCmdStamped()
+            cmd_msg.header.stamp = rospy.Time.now()
+            # Differential wheel speeds for a left turn.
+            # Example values: left wheel slower than right wheel.
+            cmd_msg.vel_left = 0.41
+            cmd_msg.vel_right = 0.7
+            self._publisher.publish(cmd_msg)
+            rate.sleep()
+        self.stop_robot()
+
     def callback(self, msg):
         current_time = rospy.Time.now()
         dt = (current_time - self.last_time).to_sec() if self.last_time else 0.1
@@ -235,22 +266,43 @@ class LaneControllerNode(DTROS):
         undistorted = self.undistort_image(cv_image)
         preprocessed = self.preprocess_image(undistorted)
         
+        # --- DOT DETECTION START ---
+        found, centers = cv2.findCirclesGrid(
+            undistorted, 
+            patternSize=self.circlepattern_dims, 
+            flags=cv2.CALIB_CB_SYMMETRIC_GRID, 
+            blobDetector=self.simple_blob_detector
+        )
+        if found and centers is not None and centers.shape[0] >= 2:
+            # Using dots at indices 5 and 6 as an example.
+            dot0 = centers[5, 0]
+            dot1 = centers[6, 0]
+            distance_dots = np.linalg.norm(dot0 - dot1)
+            if distance_dots > 9:
+                rospy.loginfo("Dot detection: distance %.2f pixels > 10, stopping robot." % distance_dots)
+                self.stop_robot()
+        
         # Detect red line.
         red_detected, red_distance, red_annotated = self.detect_red_line(preprocessed)
-        if red_detected and red_distance is not None and red_distance < 0.20:
+        if red_detected and red_distance is not None and red_distance < 0.15:
             if not self.red_line_stopped:
-                rospy.loginfo("Red line detected within 20cm. Stopping for 0.5 sec.")
-                self.stop_robot()
-                rospy.sleep(0.5)
+                self.red_line_count += 1
+                rospy.loginfo("Red line detected, count: %d", self.red_line_count)
+                if self.red_line_count == 3:
+                    rospy.loginfo("Third red line detected. Executing left 90 degree turn with 50cm radius.")
+                    self.stop_robot()
+                    rospy.sleep(0.5)
+                    self.perform_left_turn()
+                else:
+                    rospy.loginfo("Red line detected within 20cm. Stopping for 0.5 sec.")
+                    self.stop_robot()
+                    rospy.sleep(0.5)
                 self.red_line_stopped = True
         else:
-            # Reset flag when red line is not detected.
             self.red_line_stopped = False
         
         # Continue with lane detection and control.
         output, error = self.detect_lane_fast(preprocessed)
-        lane_msg = self.bridge.cv2_to_imgmsg(output, encoding="bgr8")
-        self.pub_lane.publish(lane_msg)
 
         if error is not None:
             control_output = self.get_control_output(error, dt)
