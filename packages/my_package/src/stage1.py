@@ -9,6 +9,40 @@ from sensor_msgs.msg import Image, CompressedImage
 from duckietown_msgs.msg import WheelsCmdStamped
 from duckietown.dtros import DTROS, NodeType
 
+
+# Define your two PID controllers
+class PID:
+    def __init__(self, Kp, Ki, Kd, controller_type="PID"):
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+        self.controller_type = controller_type.upper()
+        self.previous_error = 0
+        self.integral = 0
+        
+    def compute(self, error, dt):
+        # Proportional term (always included)
+        P = self.Kp * error
+        
+        # Initialize I and D terms to zero
+        I = 0
+        D = 0
+        
+        # Add integral term if using PI or PID
+        if "I" in self.controller_type:
+            self.integral += error * dt
+            I = self.Ki * self.integral
+        
+        # Add derivative term if using PD or PID
+        if "D" in self.controller_type:
+            D = self.Kd * (error - self.previous_error) / dt
+            
+        # Update previous error for next iteration
+        self.previous_error = error
+        
+        # Return the sum of active terms
+        return P + I + D
+
 class LaneControllerNode(DTROS):
     def __init__(self, node_name):
         super(LaneControllerNode, self).__init__(node_name=node_name, node_type=NodeType.PERCEPTION)
@@ -18,19 +52,37 @@ class LaneControllerNode(DTROS):
         self._camera_topic = f"/{self._vehicle_name}/camera_node/image/compressed"
         self.wheels_topic = f"/{self._vehicle_name}/wheels_driver_node/wheels_cmd"
 
-        self.detector = Detector(families="tag36h11")
+        self.dist_error = None
+
+        
         
         self.enable_lane_following = True
         self.enable_red_detection = True
+        self.enable_blue_detection = False
+        self.enable_duck_detection = False
+        self.enable_duckiebot_detection = True
+
+        self.last_duckiebot_scan_time = rospy.Time(0)
+
+
+
+
+        self.detector = Detector(families="tag36h11")
         self.last_detection_time = rospy.Time(0)
         self.detection_interval = 1  # seconds
-        
-        # Control parameters.
-        self.controller_type = "P"
-        self.Kp = -0.25
-        self.Ki = 0.001
-        self.Kd = 0.002
+
         self.base_speed = 0.4
+        
+        # Lane Control parameters.
+        self.lane_controller_type = "P"
+        self.lane_Kp = -0.25
+        self.lane_Ki = 0.001
+        self.lane_Kd = 0.002
+
+        #(Kp, Ki, Kd, controller_type)
+        self.lane_pid = PID(-0.25, 0.001, 0.002, "P")
+        self.dist_pid = PID(4, 0.001, 0.002, "P")
+        
 
         self.prev_error = 0.0
         self.integral = 0.0
@@ -66,10 +118,26 @@ class LaneControllerNode(DTROS):
         self.red_line_count = 0  # Count the number of red line detections.
         
         # Dot detection setup.
-        self.circlepattern_dims = (7, 3)
+        self.circlepattern_dims = (7, 2)
+        # blob_params = cv2.SimpleBlobDetector_Params()
+        # blob_params.minArea = 10
+        # blob_params.minDistBetweenBlobs = 2
+        # self.simple_blob_detector = cv2.SimpleBlobDetector_create(blob_params)
+
+
+        # Blob detection setup with improved parameters
         blob_params = cv2.SimpleBlobDetector_Params()
-        blob_params.minArea = 10
-        blob_params.minDistBetweenBlobs = 2
+        blob_params.minArea = 5  # Smaller minimum area
+        blob_params.maxArea = 500  # Add maximum area constraint
+        blob_params.minDistBetweenBlobs = 5
+        blob_params.filterByColor = True
+        blob_params.blobColor = 0  # Look for dark blobs (adjust if needed)
+        blob_params.filterByCircularity = True
+        blob_params.minCircularity = 0.6  # Allow for some deformation
+        blob_params.filterByConvexity = True
+        blob_params.minConvexity = 0.8
+        blob_params.filterByInertia = True  
+        blob_params.minInertiaRatio = 0.5  # Allow less circular blobs
         self.simple_blob_detector = cv2.SimpleBlobDetector_create(blob_params)
         
         # Initialize CvBridge.
@@ -79,6 +147,8 @@ class LaneControllerNode(DTROS):
         self._publisher = rospy.Publisher(self.wheels_topic, WheelsCmdStamped, queue_size=1)
         self.lane_topic = f"/{self._vehicle_name}/camera_node/image/compressed/lane"
         self.pub_lane = rospy.Publisher(self.lane_topic, Image, queue_size=15)
+        self.debug_gray_topic = f"/{self._vehicle_name}/camera_node/image/compressed/gray"
+        self.pub_debug_gray = rospy.Publisher(self.debug_gray_topic, Image, queue_size=1)
         
         # Subscribe to the camera feed.
         self.sub = rospy.Subscriber(self._camera_topic, CompressedImage, self.callback)
@@ -223,24 +293,24 @@ class LaneControllerNode(DTROS):
         return duck_line_detected, detected_distance
 
     def calculate_p_control(self, error, dt):
-        return self.Kp * error
+        return self.lane_Kp * error
 
     def calculate_pd_control(self, error, dt):
         derivative = (error - self.prev_error) / dt if dt > 0 else 0.0
         rospy.loginfo(derivative)
-        output = self.Kp * error + self.Kd * derivative
+        output = self.lane_Kp * error + self.lane_Kd * derivative
         self.prev_error = error
         return output
 
     def calculate_pid_control(self, error, dt):
         self.integral += error * dt
         derivative = (error - self.prev_error) / dt if dt > 0 else 0.0
-        output = self.Kp * error + self.Ki * self.integral + self.Kd * derivative
+        output = self.lane_Kp * error + self.lane_Ki * self.integral + self.lane_Kd * derivative
         self.prev_error = error
         return output
 
     def get_control_output(self, error, dt):
-        ctrl_type = self.controller_type.upper()
+        ctrl_type = self.lane_controller_type.upper()
         if ctrl_type == "P":
             return self.calculate_p_control(error, dt)
         elif ctrl_type == "PD":
@@ -248,23 +318,30 @@ class LaneControllerNode(DTROS):
         elif ctrl_type == "PID":
             return self.calculate_pid_control(error, dt)
         else:
-            rospy.logwarn("Unknown controller type '%s'. Using P controller.", self.controller_type)
+            rospy.logwarn("Unknown controller type '%s'. Using P controller.", self.lane_controller_type)
             return self.calculate_p_control(error, dt)
         
-    def publish_cmd(self, control_output):
+    def combine_error(self, lane_error, dist_error):
+        if dist_error is None: dist_error = 0
         # Limit control output.
-        if control_output > 0.3: 
-            control_output = 0.3
-        if control_output < -0.3: 
-            control_output = -0.3
-        left_speed = self.base_speed - control_output
-        right_speed = self.base_speed + control_output
-        
+        if lane_error > 0.3:
+            lane_error = 0.3
+        if lane_error < -0.3:
+            lane_error = -0.3
+        left_speed = self.base_speed - lane_error + dist_error
+        right_speed = self.base_speed + lane_error + dist_error
+        return left_speed, right_speed
+
+
+
+    def publish_cmd(self, left_speed, right_speed):
+        # rospy.loginfo(f"left: {left_speed} right: {right_speed}")
         cmd_msg = WheelsCmdStamped()
         cmd_msg.header.stamp = rospy.Time.now()
         cmd_msg.vel_left = left_speed
         cmd_msg.vel_right = right_speed
         self._publisher.publish(cmd_msg)
+
         
     def stop_robot(self):
         """Stop the robot by publishing zero velocities."""
@@ -302,6 +379,9 @@ class LaneControllerNode(DTROS):
         self.stop_robot()
 
     def callback(self, msg):
+
+
+
         current_time = rospy.Time.now()
         dt = (current_time - self.last_time).to_sec() if self.last_time else 0.1
         self.last_time = current_time
@@ -311,8 +391,14 @@ class LaneControllerNode(DTROS):
         undistorted = self.undistort_image(cv_image)
         preprocessed, gray = self.preprocess_image(undistorted)
 
+        debug_gray_msg = self.bridge.cv2_to_imgmsg(gray, encoding="mono8")
+        debug_gray_msg.header.stamp = rospy.Time.now()
+        self.pub_debug_gray.publish(debug_gray_msg)
+
 
         # run_apriltag_detection = False
+
+
         # if (current_time - self.last_detection_time) >= rospy.Duration(self.detection_interval):
         #     run_apriltag_detection = True
         #     self.last_detection_time = current_time
@@ -324,22 +410,44 @@ class LaneControllerNode(DTROS):
         #         detection = detections[0]
         #         rospy.loginfo(detection.tag_id)
         
+
+
+
+
         # --- DOT DETECTION START ---
-        found, centers = cv2.findCirclesGrid(
-            undistorted, 
-            patternSize=self.circlepattern_dims, 
-            flags=cv2.CALIB_CB_SYMMETRIC_GRID, 
-            blobDetector=self.simple_blob_detector
-        )
-        if found and centers is not None and centers.shape[0] >= 2:
-            # Using dots at indices 5 and 6 as an example.
-            dot0 = centers[5, 0]
-            dot1 = centers[6, 0]
-            distance_dots = np.linalg.norm(dot0 - dot1)
-            if distance_dots > 9:
-                rospy.loginfo("Dot detection: distance %.2f pixels > 10, stopping robot." % distance_dots)
-                self.stop_robot()
-        
+        duckiebot_timer = False
+        if (current_time - self.last_duckiebot_scan_time) >= rospy.Duration(0.33): # Seconds
+            duckiebot_timer = True
+            self.last_duckiebot_scan_time = current_time
+
+        if duckiebot_timer:
+            self.dist_error = None
+            # Get image dimensions
+            height, width = gray.shape
+            # Use only the top half of the image
+            top_half = gray[0:height//2, :]
+            
+            found, centers = cv2.findCirclesGrid(
+                top_half,  # Use only top half of image
+                patternSize=self.circlepattern_dims,
+                flags=cv2.CALIB_CB_SYMMETRIC_GRID,
+                blobDetector=self.simple_blob_detector
+            )
+            if found and centers is not None and centers.shape[0] >= 2:
+                # Adjust y-coordinates to account for ROI
+                # centers[:,:,1] are the y-coordinates
+                
+                # Using dots at indices 5 and 6 as an example.
+                dot0 = centers[5, 0]
+                dot1 = centers[6, 0]
+                distance_dots = np.linalg.norm(dot0 - dot1)
+                dist = 1.52 * distance_dots ** (-0.5) # fitted equation https://www.desmos.com/calculator/wclkp3m3es
+                self.dist_error = dist - 0.4 # attempt to follow at 40cm distance
+                # rospy.loginfo(f"Dot detection: distance {distance_dots} pixels, {distance}m")
+
+
+
+
         # Detect red line.
         if self.enable_red_detection:
             red_detected, red_distance = self.detect_red_line(preprocessed)
@@ -371,15 +479,18 @@ class LaneControllerNode(DTROS):
             else:
                 self.red_line_stopped = False
 
-        if self.red_line_count == 0:
-            blue_detected, blue_distance = self.detect_blue_line(preprocessed)
-            if blue_detected and blue_distance < 0.15:
-                duck_detected, duck_distance = self.detect_duck(preprocessed)
-                if duck_detected and duck_distance < 0.18:
-                    self.stop_robot()
-                else:
-                    self.stop_robot()
-                    rospy.sleep(0.5)
+
+
+
+        # if self.red_line_count == 0:
+        #     blue_detected, blue_distance = self.detect_blue_line(preprocessed)
+        #     if blue_detected and blue_distance < 0.15:
+        #         duck_detected, duck_distance = self.detect_duck(preprocessed)
+        #         if duck_detected and duck_distance < 0.18:
+        #             self.stop_robot()
+        #         else:
+        #             self.stop_robot()
+        #             rospy.sleep(0.5)
 
 
 
@@ -390,11 +501,15 @@ class LaneControllerNode(DTROS):
         
         # Continue with lane detection and control.
         if self.enable_lane_following:
-            output, error = self.detect_lane_fast(preprocessed)
+            output, lane_error = self.detect_lane_fast(preprocessed)
+            dist_corr = None
+            if self.dist_error: dist_corr = self.dist_pid.compute(self.dist_error, dt)
+            if lane_error:
+                lane_corr = self.lane_pid.compute(lane_error, dt)
+                left_speed, right_speed = self.combine_error(lane_corr, dist_corr)
+                self.publish_cmd(left_speed, right_speed)
 
-            if error is not None:
-                control_output = self.get_control_output(error, dt)
-                self.publish_cmd(control_output)
+            
 
 if __name__ == '__main__':
     node = LaneControllerNode(node_name='lane_controller_node')

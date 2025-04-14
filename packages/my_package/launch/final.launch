@@ -1,0 +1,16 @@
+<launch>
+
+  <!-- Declare the arguments this launch file expects -->
+  <arg name="veh" doc="Name of the vehicle"/>
+  <arg name="my_custom_param" default="default_value" doc="My custom parameter"/>
+
+  <group ns="$(arg veh)">
+
+    <!-- <node pkg="my_package" type="lane.py" name="LaneDetectionNode" output="screen"> -->
+    <node pkg="my_package" type="stage1.py" name="LaneControllerNode" output="screen">
+      <param name="my_node_param" value="$(arg my_custom_param)" />
+    </node>
+
+  </group>
+
+</launch>

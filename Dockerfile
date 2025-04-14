@@ -1,5 +1,5 @@
 # parameters
-ARG REPO_NAME="Mobile-Robotics"
+ARG REPO_NAME="final-project"
 ARG DESCRIPTION="ROS BASICS"
 ARG MAINTAINER="Nathan Correia (nathanc54@shaw.ca)"
 # pick an icon from: https://fontawesome.com/v4.7.0/icons/
