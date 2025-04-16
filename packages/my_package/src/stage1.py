@@ -81,7 +81,7 @@ class LaneControllerNode(DTROS):
 
         #(Kp, Ki, Kd, controller_type)
         self.lane_pid = PID(-0.25, 0.001, 0.002, "P")
-        self.dist_pid = PID(4, 0.001, 0.002, "P")
+        self.dist_pid = PID(0.03, 0.001, 0.002, "P")
         
 
         self.prev_error = 0.0
@@ -109,7 +109,8 @@ class LaneControllerNode(DTROS):
             "white": (np.array([0, 0, int(216 * 0.85)]), np.array([int(179 * 1.1), int(55 * 1.2), 255])),
             "red": (np.array([0, 70, 150]), np.array([10, 255, 255])),
             "blue": (np.array([100, 110, 100]), np.array([140, 255, 255])),
-            "duck": (np.array([6, 82, 108]),   np.array([22, 255, 255]))
+            "duck": (np.array([6, 82, 108]),   np.array([22, 255, 255])),
+            "duckblue": (np.array([50, 90, 0]),   np.array([110, 255, 255]))
         }
         
         # Flags and counters.
@@ -176,6 +177,8 @@ class LaneControllerNode(DTROS):
         Fast lane detection using fixed-height scanning.
         Scans for white pixels in the bottom half of the image.
         """
+        debug = False
+
         full_height, width = image.shape[:2]
         half_height_start = full_height // 2
         bottom_half = image[half_height_start:full_height, :]
@@ -188,19 +191,20 @@ class LaneControllerNode(DTROS):
         
         # Define scan heights.
         scan_heights = [int(height * pct) for pct in [0, 0.10, 0.20, 0.40, 0.70]]
-        output = image.copy()
-        bottom_half_out = output[half_height_start:full_height, :]
+        if debug:
+            output = image.copy()
+            bottom_half_out = output[half_height_start:full_height, :]
         
         base_weights = [0.1, 0.15, 0.2, 0.25, 0.3]
         offsets = []
         valid_detections = []
         
         for i, y in enumerate(scan_heights):
-            for x in range(center_x, width, 3):
+            for x in range(center_x, width, 5):
                 if white_mask[y, x] > 0:
                     offsets.append(x - center_x)
                     valid_detections.append(i)
-                    cv2.circle(bottom_half_out, (x, y), 3, (0, 255, 0), -1)
+                    if debug: cv2.circle(bottom_half_out, (x, y), 3, (0, 255, 0), -1)
                     break
         
         error = None
@@ -219,7 +223,7 @@ class LaneControllerNode(DTROS):
                     detection_idx = valid_detections[i]
                     y = scan_heights[detection_idx]
                     x = center_x + offset
-                    cv2.circle(bottom_half_out, (x, y), 3, (0, 0, 255), -1)
+                    if debug: cv2.circle(bottom_half_out, (x, y), 3, (0, 0, 255), -1)
                     
             if filtered_offsets:
                 total_weight = sum([base_weights[i] for i in filtered_detections])
@@ -228,11 +232,15 @@ class LaneControllerNode(DTROS):
                 error_raw = sum(weighted_offsets)
                 error = error_raw * 0.01 - 2
             
-            color = (0, 0, 255) if len(valid_detections) < 3 else (0, 255, 0)
-            cv2.putText(bottom_half_out, f"{len(valid_detections)}/5 pts, err:{error:.3f}", 
-                        (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            if debug:
+                color = (0, 0, 255) if len(valid_detections) < 3 else (0, 255, 0)
+                cv2.putText(bottom_half_out, f"{len(valid_detections)}/5 pts, err:{error:.3f}", 
+                            (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                debug_img_msg = self.bridge.cv2_to_imgmsg(bottom_half_out, encoding="bgr8")
+                debug_img_msg.header.stamp = rospy.Time.now()
+                self.pub_lane.publish(debug_img_msg)
         
-        return output, error
+        return error
 
     def detect_red_line(self, image):
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -291,6 +299,32 @@ class LaneControllerNode(DTROS):
                 duck_line_detected = True
                 
         return duck_line_detected, detected_distance
+    
+    def detect_duckblue(self, image):
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        lower, upper = self.hsv_ranges["duckblue"]
+        mask = cv2.inRange(hsv, lower, upper)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        duckblue_detected = False
+        dist_error = None
+        
+        if contours:
+            c = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(c) > 500:
+                x, y, w, h = cv2.boundingRect(c)
+                u = x + w / 2
+                v = y + h
+
+                # image_height = image.shape[0]  # Get height of the image
+                contour_height = 480 - (y + h)  # Bottom of image - bottom 
+                distance = 0.0003 * contour_height * contour_height - 0.012 * contour_height + 25.4
+                dist_error = distance - 35
+                duckblue_detected = True
+                
+        # rospy.loginfo(distance)
+                
+        return duckblue_detected, dist_error
+        
 
     def calculate_p_control(self, error, dt):
         return self.lane_Kp * error
@@ -335,7 +369,7 @@ class LaneControllerNode(DTROS):
 
 
     def publish_cmd(self, left_speed, right_speed):
-        # rospy.loginfo(f"left: {left_speed} right: {right_speed}")
+        rospy.loginfo(f"left: {left_speed} right: {right_speed}")
         cmd_msg = WheelsCmdStamped()
         cmd_msg.header.stamp = rospy.Time.now()
         cmd_msg.vel_left = left_speed
@@ -416,12 +450,12 @@ class LaneControllerNode(DTROS):
 
         # --- DOT DETECTION START ---
         duckiebot_timer = False
-        if (current_time - self.last_duckiebot_scan_time) >= rospy.Duration(0.33): # Seconds
+        if (current_time - self.last_duckiebot_scan_time) >= rospy.Duration(0.1): # Seconds
             duckiebot_timer = True
             self.last_duckiebot_scan_time = current_time
 
         if duckiebot_timer:
-            self.dist_error = None
+            # self.dist_error = None
             # Get image dimensions
             height, width = gray.shape
             # Use only the top half of the image
@@ -442,10 +476,10 @@ class LaneControllerNode(DTROS):
                 dot1 = centers[6, 0]
                 distance_dots = np.linalg.norm(dot0 - dot1)
                 dist = 1.52 * distance_dots ** (-0.5) # fitted equation https://www.desmos.com/calculator/wclkp3m3es
-                self.dist_error = dist - 0.4 # attempt to follow at 40cm distance
+                # self.dist_error = dist - 0.4 # attempt to follow at 40cm distance
                 # rospy.loginfo(f"Dot detection: distance {distance_dots} pixels, {distance}m")
 
-
+        duckblue_detected, self.dist_error = self.detect_duckblue(undistorted)
 
 
         # Detect red line.
@@ -501,7 +535,7 @@ class LaneControllerNode(DTROS):
         
         # Continue with lane detection and control.
         if self.enable_lane_following:
-            output, lane_error = self.detect_lane_fast(preprocessed)
+            lane_error = self.detect_lane_fast(preprocessed)
             dist_corr = None
             if self.dist_error: dist_corr = self.dist_pid.compute(self.dist_error, dt)
             if lane_error:
