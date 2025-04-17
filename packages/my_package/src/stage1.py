@@ -38,16 +38,20 @@ class PID:
         # Add derivative term if using PD or PID
         if "D" in self.controller_type:
             D = self.Kd * (error - self.previous_error) / dt
-            
+        
         # Update previous error for next iteration
         self.previous_error = error
         
         # The sum of active terms
         correction = P + I + D
 
-        if correction < self.negclamp: return self.negclamp
-        elif correction > self.posclamp: return self.posclamp
-        else: return correction
+        if correction < self.negclamp:
+            return self.negclamp
+        elif correction > self.posclamp:
+            return self.posclamp
+        else:
+            return correction
+
 
 class LaneControllerNode(DTROS):
     def __init__(self, node_name):
@@ -59,8 +63,9 @@ class LaneControllerNode(DTROS):
         self.wheels_topic = f"/{self._vehicle_name}/wheels_driver_node/wheels_cmd"
 
         self.dist_error = None
+        self.first_line_do_turn = None  # track first red line decision
+        self.fourth_line_do_turn = False
 
-        
         
         self.enable_lane_following = True
         self.enable_red_detection = True
@@ -69,29 +74,17 @@ class LaneControllerNode(DTROS):
         self.enable_duckiebot_detection = True
 
         self.last_duckiebot_scan_time = rospy.Time(0)
-
-
-
-
+        
         self.detector = Detector(families="tag36h11")
         self.last_detection_time = rospy.Time(0)
         self.detection_interval = 1  # seconds
 
         self.base_speed = 0.4
         
-        # Lane Control parameters.
-        self.lane_controller_type = "P"
-        self.lane_Kp = -0.25
-        self.lane_Ki = 0.001
-        self.lane_Kd = 0.002
-
-        #(Kp, Ki, Kd, controller_type)
+        # PID controllers
         self.lane_pid = PID(-0.22, 0.001, 0.002, "P", -0.4, 0.3)
         self.dist_pid = PID(0.06, 0.001, 0.002, "P", -self.base_speed, 0.2)
         
-
-        self.prev_error = 0.0
-        self.integral = 0.0
         self.last_time = rospy.Time.now()
         
         # Camera calibration parameters.
@@ -102,14 +95,20 @@ class LaneControllerNode(DTROS):
                                       -0.0018668141393665327, 0.0022895877440351907, 0.0],
                                      dtype=np.float32)
         
-        # Homography matrix (maps image coordinates to ground coordinates).
+        # Homography matrix
         self.homography = np.array([
             -0.00013679516037023445,  0.0002710547390276784,  0.32374273628358996,
             -0.0013732279193212306,  -3.481942844615056e-05,   0.43480445263628115,
             -0.0007393075649167115,   0.009592518288014648,    -1.1012483201073726
         ]).reshape(3, 3)
-        
-        # HSV ranges for lane and red line detection.
+        self.red_line_stopped = False
+        self.blue_line_stopped = False
+        self.red_line_count = 0
+        # track when we last stopped for a red line
+        self.last_red_stop_time = rospy.Time(0)
+        self.red_cooldown = rospy.Duration(3)   # 5 seconds of “ignore” time
+
+        # HSV ranges
         self.hsv_ranges = {
             "yellow": (np.array([20, 70, 100]), np.array([30, 255, 255])),
             "white": (np.array([0, 0, int(216 * 0.85)]), np.array([int(179 * 1.1), int(55 * 1.2), 255])),
@@ -119,47 +118,14 @@ class LaneControllerNode(DTROS):
             "duckblue": (np.array([50, 90, 0]),   np.array([110, 255, 255]))
         }
         
-        # Flags and counters.
-        self.red_line_stopped = False
-        self.blue_line_stopped = False
-        self.red_line_count = 0  # Count the number of red line detections.
-        
-        # Dot detection setup.
-        self.circlepattern_dims = (7, 2)
-        # blob_params = cv2.SimpleBlobDetector_Params()
-        # blob_params.minArea = 10
-        # blob_params.minDistBetweenBlobs = 2
-        # self.simple_blob_detector = cv2.SimpleBlobDetector_create(blob_params)
-
-
-        # Blob detection setup with improved parameters
-        blob_params = cv2.SimpleBlobDetector_Params()
-        blob_params.minArea = 5  # Smaller minimum area
-        blob_params.maxArea = 500  # Add maximum area constraint
-        blob_params.minDistBetweenBlobs = 5
-        blob_params.filterByColor = True
-        blob_params.blobColor = 0  # Look for dark blobs (adjust if needed)
-        blob_params.filterByCircularity = True
-        blob_params.minCircularity = 0.6  # Allow for some deformation
-        blob_params.filterByConvexity = True
-        blob_params.minConvexity = 0.8
-        blob_params.filterByInertia = True  
-        blob_params.minInertiaRatio = 0.5  # Allow less circular blobs
-        self.simple_blob_detector = cv2.SimpleBlobDetector_create(blob_params)
-        
-        # Initialize CvBridge.
+        # CvBridge and publishers/subscribers
         self.bridge = CvBridge()
-        
-        # Create publishers.
         self._publisher = rospy.Publisher(self.wheels_topic, WheelsCmdStamped, queue_size=1)
         self.lane_topic = f"/{self._vehicle_name}/camera_node/image/compressed/lane"
         self.pub_lane = rospy.Publisher(self.lane_topic, Image, queue_size=15)
         self.debug_gray_topic = f"/{self._vehicle_name}/camera_node/image/compressed/gray"
         self.pub_debug_gray = rospy.Publisher(self.debug_gray_topic, Image, queue_size=1)
-        
-        # Subscribe to the camera feed.
         self.sub = rospy.Subscriber(self._camera_topic, CompressedImage, self.callback)
-        
         self.rate = rospy.Rate(100)
         
     def undistort_image(self, image):
@@ -171,12 +137,41 @@ class LaneControllerNode(DTROS):
         return blurred, cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
 
     def compute_distance_homography(self, u, v):
-        """Compute distance from image point (u, v) using homography."""
         point_img = np.array([u, v, 1.0])
         ground_point = self.homography @ point_img
         ground_point /= ground_point[2]
         X, Y = ground_point[0], ground_point[1]
         return np.sqrt(X**2 + Y**2)
+
+    def detect_duckblue(self, image):
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        lower, upper = self.hsv_ranges["duckblue"]
+        mask = cv2.inRange(hsv, lower, upper)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        duckblue_detected = False
+        dist_error = None
+        left_dist = None
+        right_dist = None
+        img_width = image.shape[1]
+
+        valid = [c for c in contours if cv2.contourArea(c) > 500]
+        if valid:
+            rects = [cv2.boundingRect(c) for c in valid]
+            xs = [x for x, y, w, h in rects]
+            rights = [x + w for x, y, w, h in rects]
+            leftmost = min(xs)
+            rightmost = max(rights)
+            left_dist = leftmost
+            right_dist = img_width - rightmost
+
+            c = max(valid, key=cv2.contourArea)
+            x, y, w, h = cv2.boundingRect(c)
+            contour_height = 480 - (y + h)
+            distance = 0.0003 * contour_height**2 - 0.012 * contour_height + 25.4
+            dist_error = distance - 35
+            duckblue_detected = True
+
+        return duckblue_detected, dist_error, left_dist, right_dist
 
     def detect_lane_fast(self, image):
         """
@@ -255,269 +250,113 @@ class LaneControllerNode(DTROS):
         lower, upper = self.hsv_ranges["red"]
         mask = cv2.inRange(hsv, lower, upper)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        red_line_detected = False
-        detected_distance = None
-        
         if contours:
             c = max(contours, key=cv2.contourArea)
             if cv2.contourArea(c) > 500:
                 x, y, w, h = cv2.boundingRect(c)
-                u = x + w / 2
+                u = x + w/2
                 v = y + h
-                detected_distance = self.compute_distance_homography(u, v)
-                red_line_detected = True
-                
-        return red_line_detected, detected_distance
-    
+                dist = self.compute_distance_homography(u, v)
+                return True, dist
+        return False, None
 
-    def detect_blue_line(self, image):
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        lower, upper = self.hsv_ranges["blue"]
-        mask = cv2.inRange(hsv, lower, upper)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        blue_line_detected = False
-        detected_distance = None
-        
-        if contours:
-            c = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(c) > 500:
-                x, y, w, h = cv2.boundingRect(c)
-                u = x + w / 2
-                v = y + h
-                detected_distance = self.compute_distance_homography(u, v)
-                blue_line_detected = True
-                
-        return blue_line_detected, detected_distance
-    
-    def detect_duck(self, image):
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        lower, upper = self.hsv_ranges["duck"]
-        mask = cv2.inRange(hsv, lower, upper)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        duck_line_detected = False
-        detected_distance = None
-        
-        if contours:
-            c = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(c) > 500:
-                x, y, w, h = cv2.boundingRect(c)
-                u = x + w / 2
-                v = y + h
-                detected_distance = self.compute_distance_homography(u, v)
-                duck_line_detected = True
-                
-        return duck_line_detected, detected_distance
-    
-    def detect_duckblue(self, image):
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        lower, upper = self.hsv_ranges["duckblue"]
-        mask = cv2.inRange(hsv, lower, upper)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        duckblue_detected = False
-        dist_error = None
-        
-        if contours:
-            c = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(c) > 500:
-                x, y, w, h = cv2.boundingRect(c)
-                u = x + w / 2
-                v = y + h
-
-                # image_height = image.shape[0]  # Get height of the image
-                contour_height = 480 - (y + h)  # Bottom of image - bottom 
-                distance = 0.0003 * contour_height * contour_height - 0.012 * contour_height + 25.4
-                dist_error = distance - 35
-                duckblue_detected = True
-                
-        # rospy.loginfo(distance)
-                
-        return duckblue_detected, dist_error
-        
     def combine_error(self, lane_error, dist_error):
         if dist_error is None: dist_error = 0
         left_speed = self.base_speed - lane_error + dist_error
         right_speed = self.base_speed + lane_error + dist_error
         return left_speed, right_speed
 
-
-
     def publish_cmd(self, left_speed, right_speed):
-        # rospy.loginfo(f"left: {left_speed} right: {right_speed}")
-        cmd_msg = WheelsCmdStamped()
-        cmd_msg.header.stamp = rospy.Time.now()
-        cmd_msg.vel_left = left_speed
-        cmd_msg.vel_right = right_speed
-        self._publisher.publish(cmd_msg)
+        cmd = WheelsCmdStamped()
+        cmd.header.stamp = rospy.Time.now()
+        cmd.vel_left = left_speed
+        cmd.vel_right = right_speed
+        self._publisher.publish(cmd)
 
-        
     def stop_robot(self):
-        """Stop the robot by publishing zero velocities."""
-        cmd_msg = WheelsCmdStamped()
-        cmd_msg.header.stamp = rospy.Time.now()
-        cmd_msg.vel_left = 0.0
-        cmd_msg.vel_right = 0.0
-        self._publisher.publish(cmd_msg)
-        
+        cmd = WheelsCmdStamped()
+        cmd.header.stamp = rospy.Time.now()
+        cmd.vel_left = 0.0
+        cmd.vel_right = 0.0
+        self._publisher.publish(cmd)
+
     def perform_left_turn(self):
-        """
-        Execute a left turn of 90 degrees with a turning radius of 50 cm.
-        For a turning radius R = 0.5 m and a chosen linear speed (e.g. 0.3 m/s),
-        the angular velocity omega = 0.3 / 0.5 = 0.6 rad/s.
-        A 90° turn requires an angle of pi/2 ≈ 1.57 rad, so the turn duration is:
-              t = 1.57 / 0.6 ≈ 2.62 seconds.
-        """
         self.enable_lane_following = False
         self.enable_red_detection = False
-        turn_duration = 4  # seconds
-        start_time = rospy.Time.now().to_sec()
-        rate = rospy.Rate(10)  # 10 Hz
-        rospy.loginfo("Turning left 90 degrees with 50cm radius; duration: %.2f sec", turn_duration)
-        while rospy.Time.now().to_sec() - start_time < turn_duration and not rospy.is_shutdown():
-            cmd_msg = WheelsCmdStamped()
-            cmd_msg.header.stamp = rospy.Time.now()
-            # Differential wheel speeds for a left turn.
-            # Example values: left wheel slower than right wheel.
-            cmd_msg.vel_left = 0.41
-            cmd_msg.vel_right = 0.7
-            self._publisher.publish(cmd_msg)
+        duration = 4
+        start = rospy.Time.now().to_sec()
+        rate = rospy.Rate(10)
+        while rospy.Time.now().to_sec() - start < duration and not rospy.is_shutdown():
+            cmd = WheelsCmdStamped()
+            cmd.header.stamp = rospy.Time.now()
+            cmd.vel_left = 0.41
+            cmd.vel_right = 0.7
+            self._publisher.publish(cmd)
             rate.sleep()
         self.enable_lane_following = True
         self.enable_red_detection = True
         self.stop_robot()
 
     def callback(self, msg):
-        
-        
+        current = rospy.Time.now()
+        dt = (current - self.last_time).to_sec()
+        self.last_time = current
 
-        current_time = rospy.Time.now()
-        dt = (current_time - self.last_time).to_sec() if self.last_time else 0.1
-        self.last_time = current_time
-
-        # Convert the image.
-        cv_image = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        cv_image = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
         undistorted = self.undistort_image(cv_image)
         preprocessed, gray = self.preprocess_image(undistorted)
 
-        # debug_gray_msg = self.bridge.cv2_to_imgmsg(gray, encoding="mono8")
-        # debug_gray_msg.header.stamp = rospy.Time.now()
-        # self.pub_debug_gray.publish(debug_gray_msg)
+        # 1) Duck–blue detection as before...
+        db_detected, self.dist_error, left_dist, right_dist = self.detect_duckblue(undistorted)
 
+        # 2) Red‐line logic *only if* cooldown expired:
+        if self.enable_red_detection and (current - self.last_red_stop_time) > self.red_cooldown:
+            red_detected, red_dist = self.detect_red_line(preprocessed)
+            if red_detected and red_dist is not None and red_dist < 0.15:
+                # record the stop time so we ignore for next 5 s:
+                self.last_red_stop_time = current
 
-        # run_apriltag_detection = False
+                # increment & stop:
+                self.red_line_count += 1
+                self.stop_robot()
+                rospy.sleep(0.5)
 
-
-        # if (current_time - self.last_detection_time) >= rospy.Duration(self.detection_interval):
-        #     run_apriltag_detection = True
-        #     self.last_detection_time = current_time
-
-        # detection = None
-        # if self.red_line_count == 0 and detection is None and run_apriltag_detection:
-        #     detections = self.detector.detect(gray)
-        #     if detections:
-        #         detection = detections[0]
-        #         rospy.loginfo(detection.tag_id)
-        
-
-
-
-
-        # --- DOT DETECTION START ---
-        duckiebot_timer = False
-        if self.enable_duckiebot_detection and (current_time - self.last_duckiebot_scan_time) >= rospy.Duration(0.1): # Seconds
-            duckiebot_timer = True
-            self.last_duckiebot_scan_time = current_time
-
-        if self.enable_duckiebot_detection and duckiebot_timer:
-            # self.dist_error = None
-            # Get image dimensions
-            height, width = gray.shape
-            # Use only the top half of the image
-            top_half = gray[0:height//2, :]
-            
-            found, centers = cv2.findCirclesGrid(
-                top_half,  # Use only top half of image
-                patternSize=self.circlepattern_dims,
-                flags=cv2.CALIB_CB_SYMMETRIC_GRID,
-                blobDetector=self.simple_blob_detector
-            )
-            if found and centers is not None and centers.shape[0] >= 2:
-                # Adjust y-coordinates to account for ROI
-                # centers[:,:,1] are the y-coordinates
-                
-                # Using dots at indices 5 and 6 as an example.
-                dot0 = centers[5, 0]
-                dot1 = centers[6, 0]
-                distance_dots = np.linalg.norm(dot0 - dot1)
-                dist = 1.52 * distance_dots ** (-0.5) # fitted equation https://www.desmos.com/calculator/wclkp3m3es
-                # self.dist_error = dist - 0.4 # attempt to follow at 40cm distance
-                # rospy.loginfo(f"Dot detection: distance {distance_dots} pixels, {distance}m")
-
-        duckblue_detected, self.dist_error = self.detect_duckblue(undistorted)
-
-
-        # Detect red line.
-        if self.enable_red_detection:
-            red_detected, red_distance = self.detect_red_line(preprocessed)
-            if red_detected and red_distance is not None and red_distance < 0.15:
-                if not self.red_line_stopped:
-                    self.red_line_count += 1
-                    rospy.loginfo("Red line detected, count: %d", self.red_line_count)
-                    if self.red_line_count == 3:
-                        rospy.loginfo("Third red line detected. Executing left 90 degree turn with 50cm radius.")
-                        self.stop_robot()
-                        rospy.sleep(0.5)
-                        self.perform_left_turn()
-                    elif self.red_line_count == 4:
-                        rospy.loginfo("Fourth red line detected. Thinking")
-                        self.stop_robot()
-                        detections = self.detector.detect(gray)
-                        detection = detections[-1]
-                        rospy.sleep(0.5)
-                        if not detection: rospy.loginfo("not detection")
-                        if not detection.tag_id == 133: rospy.loginfo("not detection.tag_id == 133")
-                        if detection.tag_id == 133:
-                            rospy.loginfo("Left turn")
+                # now do your per‐line decision logic:
+                if self.red_line_count == 1:
+                    # first‐line turn logic...
+                    if left_dist is not None and right_dist is not None:
+                        rospy.loginfo(left_dist,right_dist)
+                        if left_dist > right_dist +10:
+                            self.first_line_do_turn = False
+                        else:
+                            self.first_line_do_turn = True
                             self.perform_left_turn()
-                    else:
-                        rospy.loginfo("Red line detected within 20cm. Stopping for 0.5 sec.")
-                        self.stop_robot()
-                        rospy.sleep(0.5)
-                    self.red_line_stopped = True
-            else:
-                self.red_line_stopped = False
+                elif self.red_line_count == 3:
+                    # third‐line invert logic...
+                    if not self.first_line_do_turn:
+                        self.perform_left_turn()
+                elif self.red_line_count == 4:
+                    # april‐tag logic...
+                    detections = self.detector.detect(gray)
+                    if detections and detections[0].tag_id == 133:
+                        self.perform_left_turn()
+                elif self.red_line_count == 5:
+                # if we *didn't* turn on #4, do it now; else just stay stopped
+                    if not self.fourth_line_do_turn:
+                        self.perform_left_turn()
 
-
-
-
-        # if self.red_line_count == 0:
-        #     blue_detected, blue_distance = self.detect_blue_line(preprocessed)
-        #     if blue_detected and blue_distance < 0.15:
-        #         duck_detected, duck_distance = self.detect_duck(preprocessed)
-        #         if duck_detected and duck_distance < 0.18:
-        #             self.stop_robot()
-        #         else:
-        #             self.stop_robot()
-        #             rospy.sleep(0.5)
-
-
-
-
-
-                
         
-        
-        # Continue with lane detection and control.
+        # 3) Lane‐following as before...
         if self.enable_lane_following:
             lane_error = self.detect_lane_fast(preprocessed)
-            dist_corr = None
-            if self.dist_error: dist_corr = self.dist_pid.compute(self.dist_error, dt)
-            if lane_error:
+            dist_corr = self.dist_pid.compute(self.dist_error, dt) if self.dist_error else None
+            if lane_error is not None:
                 lane_corr = self.lane_pid.compute(lane_error, dt)
-                left_speed, right_speed = self.combine_error(lane_corr, dist_corr)
-                self.publish_cmd(left_speed, right_speed)
+                ls, rs = self.combine_error(lane_corr, dist_corr)
+                self.publish_cmd(ls, rs)
 
-            
+
 
 if __name__ == '__main__':
-    node = LaneControllerNode(node_name='lane_controller_node')
+    node = LaneControllerNode('lane_controller_node')
     rospy.spin()
