@@ -66,6 +66,9 @@ class LaneControllerNode(DTROS):
         self.first_line_do_turn = None  # track first red line decision
         self.fourth_line_do_turn = False
 
+        self.first_line_do_turn_locked_on = False
+        self.left_turn_start_time = None
+
         
         self.enable_lane_following = True
         self.enable_red_detection = True
@@ -280,22 +283,24 @@ class LaneControllerNode(DTROS):
         cmd.vel_right = 0.0
         self._publisher.publish(cmd)
 
-    def perform_left_turn(self):
+    def perform_left_turn(self, image):
         self.enable_lane_following = False
         self.enable_red_detection = False
-        duration = 4
-        start = rospy.Time.now().to_sec()
-        rate = rospy.Rate(10)
-        while rospy.Time.now().to_sec() - start < duration and not rospy.is_shutdown():
-            cmd = WheelsCmdStamped()
-            cmd.header.stamp = rospy.Time.now()
-            cmd.vel_left = 0.41
-            cmd.vel_right = 0.7
-            self._publisher.publish(cmd)
-            rate.sleep()
-        self.enable_lane_following = True
-        self.enable_red_detection = True
-        self.stop_robot()
+        if self.left_turn_start_time is None: self.left_turn_start_time = rospy.Time.now().to_sec()
+
+        cmd = WheelsCmdStamped()
+        cmd.header.stamp = rospy.Time.now()
+        cmd.vel_left = 0.41
+        cmd.vel_right = 0.65
+        self._publisher.publish(cmd)
+
+        lane_error = self.detect_lane_fast(image)
+        # rospy.loginfo(lane_error)
+        if abs(lane_error) < 0.5 and rospy.Time.now().to_sec() - self.left_turn_start_time > 3:
+            self.enable_lane_following = True
+            self.enable_red_detection = True
+            self.first_line_do_turn_locked_on = True
+            rospy.loginfo("locked on")
 
     def callback(self, msg):
         current = rospy.Time.now()
@@ -313,7 +318,7 @@ class LaneControllerNode(DTROS):
         if self.enable_red_detection and (current - self.last_red_stop_time) > self.red_cooldown:
             red_detected, red_dist = self.detect_red_line(preprocessed)
             if red_detected and red_dist is not None and red_dist < 0.15:
-                # record the stop time so we ignore for next 5 s:
+                # record the stop time so we ignore for next 3 s:
                 self.last_red_stop_time = current
 
                 # increment & stop:
@@ -325,25 +330,29 @@ class LaneControllerNode(DTROS):
                 if self.red_line_count == 1:
                     # first‐line turn logic...
                     if left_dist is not None and right_dist is not None:
-                        rospy.loginfo(left_dist,right_dist)
-                        if left_dist > right_dist +10:
+                        rospy.loginfo(f"Left: {left_dist} Right: {right_dist}")
+                        if left_dist > right_dist + 10:
                             self.first_line_do_turn = False
                         else:
+                            rospy.loginfo("Turning left")
                             self.first_line_do_turn = True
-                            self.perform_left_turn()
                 elif self.red_line_count == 3:
                     # third‐line invert logic...
                     if not self.first_line_do_turn:
-                        self.perform_left_turn()
+                        self.perform_left_turn(preprocessed)
                 elif self.red_line_count == 4:
                     # april‐tag logic...
                     detections = self.detector.detect(gray)
                     if detections and detections[0].tag_id == 133:
-                        self.perform_left_turn()
+                        self.perform_left_turn(preprocessed)
                 elif self.red_line_count == 5:
                 # if we *didn't* turn on #4, do it now; else just stay stopped
                     if not self.fourth_line_do_turn:
-                        self.perform_left_turn()
+                        self.perform_left_turn(preprocessed)
+
+
+        if self.red_line_count == 1 and self.first_line_do_turn is True and self.first_line_do_turn_locked_on is False:
+            self.perform_left_turn(preprocessed)
 
         
         # 3) Lane‐following as before...
