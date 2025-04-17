@@ -12,13 +12,15 @@ from duckietown.dtros import DTROS, NodeType
 
 # Define your two PID controllers
 class PID:
-    def __init__(self, Kp, Ki, Kd, controller_type="PID"):
+    def __init__(self, Kp, Ki, Kd, controller_type, negclamp, posclamp):
         self.Kp = Kp
         self.Ki = Ki
         self.Kd = Kd
         self.controller_type = controller_type.upper()
         self.previous_error = 0
         self.integral = 0
+        self.negclamp = negclamp
+        self.posclamp = posclamp
         
     def compute(self, error, dt):
         # Proportional term (always included)
@@ -40,8 +42,12 @@ class PID:
         # Update previous error for next iteration
         self.previous_error = error
         
-        # Return the sum of active terms
-        return P + I + D
+        # The sum of active terms
+        correction = P + I + D
+
+        if correction < self.negclamp: return self.negclamp
+        elif correction > self.posclamp: return self.posclamp
+        else: return correction
 
 class LaneControllerNode(DTROS):
     def __init__(self, node_name):
@@ -80,8 +86,8 @@ class LaneControllerNode(DTROS):
         self.lane_Kd = 0.002
 
         #(Kp, Ki, Kd, controller_type)
-        self.lane_pid = PID(-0.25, 0.001, 0.002, "P")
-        self.dist_pid = PID(0.03, 0.001, 0.002, "P")
+        self.lane_pid = PID(-0.22, 0.001, 0.002, "P", -0.4, 0.3)
+        self.dist_pid = PID(0.06, 0.001, 0.002, "P", -self.base_speed, 0.2)
         
 
         self.prev_error = 0.0
@@ -154,7 +160,7 @@ class LaneControllerNode(DTROS):
         # Subscribe to the camera feed.
         self.sub = rospy.Subscriber(self._camera_topic, CompressedImage, self.callback)
         
-        self.rate = rospy.Rate(2)
+        self.rate = rospy.Rate(100)
         
     def undistort_image(self, image):
         return cv2.undistort(image, self.camera_matrix, self.dist_coeffs)
@@ -230,7 +236,7 @@ class LaneControllerNode(DTROS):
                 normalized_weights = [base_weights[i] / total_weight for i in filtered_detections]
                 weighted_offsets = [filtered_offsets[i] * normalized_weights[i] for i in range(len(filtered_offsets))]
                 error_raw = sum(weighted_offsets)
-                error = error_raw * 0.01 - 2
+                error = error_raw * 0.01 - 1.8
             
             if debug:
                 color = (0, 0, 255) if len(valid_detections) < 3 else (0, 255, 0)
@@ -239,6 +245,8 @@ class LaneControllerNode(DTROS):
                 debug_img_msg = self.bridge.cv2_to_imgmsg(bottom_half_out, encoding="bgr8")
                 debug_img_msg.header.stamp = rospy.Time.now()
                 self.pub_lane.publish(debug_img_msg)
+        else:
+            error = 10
         
         return error
 
@@ -325,43 +333,8 @@ class LaneControllerNode(DTROS):
                 
         return duckblue_detected, dist_error
         
-
-    def calculate_p_control(self, error, dt):
-        return self.lane_Kp * error
-
-    def calculate_pd_control(self, error, dt):
-        derivative = (error - self.prev_error) / dt if dt > 0 else 0.0
-        rospy.loginfo(derivative)
-        output = self.lane_Kp * error + self.lane_Kd * derivative
-        self.prev_error = error
-        return output
-
-    def calculate_pid_control(self, error, dt):
-        self.integral += error * dt
-        derivative = (error - self.prev_error) / dt if dt > 0 else 0.0
-        output = self.lane_Kp * error + self.lane_Ki * self.integral + self.lane_Kd * derivative
-        self.prev_error = error
-        return output
-
-    def get_control_output(self, error, dt):
-        ctrl_type = self.lane_controller_type.upper()
-        if ctrl_type == "P":
-            return self.calculate_p_control(error, dt)
-        elif ctrl_type == "PD":
-            return self.calculate_pd_control(error, dt)
-        elif ctrl_type == "PID":
-            return self.calculate_pid_control(error, dt)
-        else:
-            rospy.logwarn("Unknown controller type '%s'. Using P controller.", self.lane_controller_type)
-            return self.calculate_p_control(error, dt)
-        
     def combine_error(self, lane_error, dist_error):
         if dist_error is None: dist_error = 0
-        # Limit control output.
-        if lane_error > 0.3:
-            lane_error = 0.3
-        if lane_error < -0.3:
-            lane_error = -0.3
         left_speed = self.base_speed - lane_error + dist_error
         right_speed = self.base_speed + lane_error + dist_error
         return left_speed, right_speed
@@ -369,7 +342,7 @@ class LaneControllerNode(DTROS):
 
 
     def publish_cmd(self, left_speed, right_speed):
-        rospy.loginfo(f"left: {left_speed} right: {right_speed}")
+        # rospy.loginfo(f"left: {left_speed} right: {right_speed}")
         cmd_msg = WheelsCmdStamped()
         cmd_msg.header.stamp = rospy.Time.now()
         cmd_msg.vel_left = left_speed
@@ -413,8 +386,8 @@ class LaneControllerNode(DTROS):
         self.stop_robot()
 
     def callback(self, msg):
-
-
+        
+        
 
         current_time = rospy.Time.now()
         dt = (current_time - self.last_time).to_sec() if self.last_time else 0.1
@@ -425,9 +398,9 @@ class LaneControllerNode(DTROS):
         undistorted = self.undistort_image(cv_image)
         preprocessed, gray = self.preprocess_image(undistorted)
 
-        debug_gray_msg = self.bridge.cv2_to_imgmsg(gray, encoding="mono8")
-        debug_gray_msg.header.stamp = rospy.Time.now()
-        self.pub_debug_gray.publish(debug_gray_msg)
+        # debug_gray_msg = self.bridge.cv2_to_imgmsg(gray, encoding="mono8")
+        # debug_gray_msg.header.stamp = rospy.Time.now()
+        # self.pub_debug_gray.publish(debug_gray_msg)
 
 
         # run_apriltag_detection = False
@@ -450,11 +423,11 @@ class LaneControllerNode(DTROS):
 
         # --- DOT DETECTION START ---
         duckiebot_timer = False
-        if (current_time - self.last_duckiebot_scan_time) >= rospy.Duration(0.1): # Seconds
+        if self.enable_duckiebot_detection and (current_time - self.last_duckiebot_scan_time) >= rospy.Duration(0.1): # Seconds
             duckiebot_timer = True
             self.last_duckiebot_scan_time = current_time
 
-        if duckiebot_timer:
+        if self.enable_duckiebot_detection and duckiebot_timer:
             # self.dist_error = None
             # Get image dimensions
             height, width = gray.shape
