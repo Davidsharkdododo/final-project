@@ -6,9 +6,22 @@ import numpy as np
 from cv_bridge import CvBridge
 from dt_apriltags import Detector
 from sensor_msgs.msg import Image, CompressedImage
-from duckietown_msgs.msg import WheelsCmdStamped
+from duckietown_msgs.msg import WheelsCmdStamped, WheelEncoderStamped, LEDPattern
 from duckietown.dtros import DTROS, NodeType
+from std_msgs.msg import Header, ColorRGBA
+import message_filters
 
+
+Wheel_rad = 0.0318
+Wheel_base = 0.1
+
+def compute_distance(ticks):
+    rotations = ticks/135
+    return 2 * 3.1415 * Wheel_rad * rotations
+
+def compute_ticks(distance):
+    rotations = distance / (2 * 3.1415 * Wheel_rad)
+    return rotations * 135
 
 # Define your two PID controllers
 class PID:
@@ -22,7 +35,7 @@ class PID:
         self.negclamp = negclamp
         self.posclamp = posclamp
         
-    def compute(self, error, dt):
+    def compute(self, error, dt=None):
         # Proportional term (always included)
         P = self.Kp * error
         
@@ -61,13 +74,21 @@ class LaneControllerNode(DTROS):
         self._vehicle_name = os.environ['VEHICLE_NAME']
         self._camera_topic = f"/{self._vehicle_name}/camera_node/image/compressed"
         self.wheels_topic = f"/{self._vehicle_name}/wheels_driver_node/wheels_cmd"
+        self._left_encoder_topic = f"/{self._vehicle_name}/left_wheel_encoder_node/tick"
+        self._right_encoder_topic = f"/{self._vehicle_name}/right_wheel_encoder_node/tick"
 
         self.dist_error = None
         self.first_line_do_turn = None  # track first red line decision
         self.fourth_line_do_turn = False
+        self.fourth_line_do_turn = False
 
-        self.first_line_do_turn_locked_on = False
+        self.turn_locked_on = False
         self.left_turn_start_time = None
+
+        self._ticks_left = 0
+        self._ticks_right = 0
+        self.init_ticks_left = 0
+        self.init_ticks_right = 0
 
         
         self.enable_lane_following = True
@@ -82,11 +103,12 @@ class LaneControllerNode(DTROS):
         self.last_detection_time = rospy.Time(0)
         self.detection_interval = 1  # seconds
 
-        self.base_speed = 0.4
+        self.base_speed = 0.5
         
         # PID controllers
-        self.lane_pid = PID(-0.22, 0.001, 0.002, "P", -0.4, 0.3)
+        self.lane_pid = PID(-0.22, 0.001, 0.002, "P", -0.2, 0.3)
         self.dist_pid = PID(0.06, 0.001, 0.002, "P", -self.base_speed, 0.2)
+        self.tick_pid = PID(0.02, 0.001, 0.002, "P", -0.3, 0.3)
         
         self.last_time = rospy.Time.now()
         
@@ -128,9 +150,34 @@ class LaneControllerNode(DTROS):
         self.pub_lane = rospy.Publisher(self.lane_topic, Image, queue_size=15)
         self.debug_gray_topic = f"/{self._vehicle_name}/camera_node/image/compressed/gray"
         self.pub_debug_gray = rospy.Publisher(self.debug_gray_topic, Image, queue_size=1)
-        self.sub = rospy.Subscriber(self._camera_topic, CompressedImage, self.callback)
-        self.rate = rospy.Rate(100)
+        # self.sub = rospy.Subscriber(self._camera_topic, CompressedImage, self.callback)
+        # self.sub_left = rospy.Subscriber(self._left_encoder_topic, WheelEncoderStamped, self.callback_left)
+        # self.sub_right = rospy.Subscriber(self._right_encoder_topic, WheelEncoderStamped, self.callback_right)
         
+        image_sub = message_filters.Subscriber(self._camera_topic, CompressedImage)
+        left_sub = message_filters.Subscriber(self._left_encoder_topic, WheelEncoderStamped)
+        right_sub = message_filters.Subscriber(self._right_encoder_topic, WheelEncoderStamped)
+
+        ts = message_filters.ApproximateTimeSynchronizer(
+            [image_sub, left_sub, right_sub], 
+            queue_size=1, 
+            slop=0.1  # 100ms tolerance
+        )
+        ts.registerCallback(self.callback)
+
+
+        self.rate = rospy.Rate(100)
+        self.encoder_rate_slow = rospy.Rate(1)
+        self.encoder_rate_fast = rospy.Rate(5)
+
+
+
+    def callback_left(self, data):
+        self._ticks_left = data.data
+
+    def callback_right(self, data):
+        self._ticks_right = data.data
+
     def undistort_image(self, image):
         return cv2.undistort(image, self.camera_matrix, self.dist_coeffs)
 
@@ -194,21 +241,26 @@ class LaneControllerNode(DTROS):
         center_x = width // 2
         
         # Define scan heights.
-        scan_heights = [int(height * pct) for pct in [0, 0.10, 0.20, 0.40, 0.70]]
+        # scan_heights = [int(height * pct) for pct in [0, 0.10, 0.20, 0.40, 0.70]]
+        scan_heights = [int(height * pct) for pct in [0.70, 0.40, 0.20, 0.10, 0]]
         if debug:
             output = image.copy()
             bottom_half_out = output[half_height_start:full_height, :]
         
-        base_weights = [0.1, 0.15, 0.2, 0.25, 0.3]
+        # base_weights = [0.1, 0.15, 0.2, 0.25, 0.3]
+        base_weights = [0.3, 0.25, 0.2, 0.15, 0.1]
         offsets = []
         valid_detections = []
         
         for i, y in enumerate(scan_heights):
-            for x in range(center_x, width, 5):
+            for x in range(center_x, width, 50):
                 if white_mask[y, x] > 0:
-                    offsets.append(x - center_x)
-                    valid_detections.append(i)
-                    if debug: cv2.circle(bottom_half_out, (x, y), 3, (0, 255, 0), -1)
+                    for x2 in range(x, x - 50, -5):
+                        if not white_mask[y, x2] > 0:
+                            offsets.append(x2 + 5 - center_x)
+                            valid_detections.append(i)
+                            if debug: cv2.circle(bottom_half_out, (x2, y), 3, (0, 255, 0), -1)                    
+                            break
                     break
         
         error = None
@@ -234,7 +286,7 @@ class LaneControllerNode(DTROS):
                 normalized_weights = [base_weights[i] / total_weight for i in filtered_detections]
                 weighted_offsets = [filtered_offsets[i] * normalized_weights[i] for i in range(len(filtered_offsets))]
                 error_raw = sum(weighted_offsets)
-                error = error_raw * 0.01 - 1.8
+                error = error_raw * 0.01 - 1.5
             
             if debug:
                 color = (0, 0, 255) if len(valid_detections) < 3 else (0, 255, 0)
@@ -245,6 +297,7 @@ class LaneControllerNode(DTROS):
                 self.pub_lane.publish(debug_img_msg)
         else:
             error = 10
+            # rospy.loginfo("error is none")
         
         return error
 
@@ -270,6 +323,7 @@ class LaneControllerNode(DTROS):
         return left_speed, right_speed
 
     def publish_cmd(self, left_speed, right_speed):
+        # rospy.loginfo(f"Left: {left_speed}, Right: {right_speed}")
         cmd = WheelsCmdStamped()
         cmd.header.stamp = rospy.Time.now()
         cmd.vel_left = left_speed
@@ -283,26 +337,43 @@ class LaneControllerNode(DTROS):
         cmd.vel_right = 0.0
         self._publisher.publish(cmd)
 
-    def perform_left_turn(self, image):
+    def perform_left_turn(self, image, radius):
         self.enable_lane_following = False
         self.enable_red_detection = False
-        if self.left_turn_start_time is None: self.left_turn_start_time = rospy.Time.now().to_sec()
+        if self.left_turn_start_time is None: 
+            self.left_turn_start_time = rospy.Time.now().to_sec()
+            self.init_ticks_left = self._ticks_left
+            self.init_ticks_right = self._ticks_right
 
-        cmd = WheelsCmdStamped()
-        cmd.header.stamp = rospy.Time.now()
-        cmd.vel_left = 0.41
-        cmd.vel_right = 0.65
-        self._publisher.publish(cmd)
+
+        dist_ratio = (radius - 0.05) / (radius + 0.05)
+
+        left_dist = self._ticks_left - self.init_ticks_left
+        right_dist = self._ticks_right - self.init_ticks_right
+        
+        diff = abs(left_dist) - abs(right_dist)*dist_ratio
+
+        corr = self.tick_pid.compute(diff)
+
+        # rospy.loginfo(f"diff: {diff} corr: {corr}")
+
+        self.publish_cmd((0.5 * (radius - 0.05) / radius) - corr, (0.5 * (radius + 0.05) / radius) + corr)
+
 
         lane_error = self.detect_lane_fast(image)
         # rospy.loginfo(lane_error)
         if abs(lane_error) < 0.5 and rospy.Time.now().to_sec() - self.left_turn_start_time > 3:
             self.enable_lane_following = True
             self.enable_red_detection = True
-            self.first_line_do_turn_locked_on = True
+            self.turn_locked_on = True
             rospy.loginfo("locked on")
 
-    def callback(self, msg):
+    def callback(self, msg, left_encoder_msg, right_encoder_msg):
+
+
+        self._ticks_left = left_encoder_msg.data
+        self._ticks_right = right_encoder_msg.data
+
         current = rospy.Time.now()
         dt = (current - self.last_time).to_sec()
         self.last_time = current
@@ -323,6 +394,7 @@ class LaneControllerNode(DTROS):
 
                 # increment & stop:
                 self.red_line_count += 1
+                rospy.loginfo(f"red line count: {self.red_line_count}")
                 self.stop_robot()
                 rospy.sleep(0.5)
 
@@ -337,22 +409,34 @@ class LaneControllerNode(DTROS):
                             rospy.loginfo("Turning left")
                             self.first_line_do_turn = True
                 elif self.red_line_count == 3:
-                    # third‐line invert logic...
-                    if not self.first_line_do_turn:
-                        self.perform_left_turn(preprocessed)
+                    self.left_turn_start_time = None
+                    self.turn_locked_on = False
                 elif self.red_line_count == 4:
+                    self.left_turn_start_time = None
+                    self.turn_locked_on = False
+
                     # april‐tag logic...
                     detections = self.detector.detect(gray)
-                    if detections and detections[0].tag_id == 133:
-                        self.perform_left_turn(preprocessed)
+                    if detections: rospy.loginfo(f"tag id: {detections[0].tag_id}")
+                    else: rospy.loginfo("no apriltag")
+                    if detections and detections[0].tag_id == 48:
+                        self.fourth_line_do_turn = True
+                    else:
+                        self.fourth_line_do_turn = False
                 elif self.red_line_count == 5:
-                # if we *didn't* turn on #4, do it now; else just stay stopped
-                    if not self.fourth_line_do_turn:
-                        self.perform_left_turn(preprocessed)
+                    self.left_turn_start_time = None
+                    self.turn_locked_on = False
 
 
-        if self.red_line_count == 1 and self.first_line_do_turn is True and self.first_line_do_turn_locked_on is False:
-            self.perform_left_turn(preprocessed)
+        if self.red_line_count == 1 and self.first_line_do_turn is True and self.turn_locked_on is False:
+            self.perform_left_turn(preprocessed, 0.55)
+        elif self.red_line_count == 3 and not self.first_line_do_turn and self.turn_locked_on is False:
+            self.perform_left_turn(preprocessed, 0.55)
+        elif self.red_line_count == 4 and self.fourth_line_do_turn and self.turn_locked_on is False:
+            self.perform_left_turn(preprocessed, 0.55)
+        elif self.red_line_count == 5 and not self.fourth_line_do_turn and self.turn_locked_on is False:
+            self.perform_left_turn(preprocessed, 0.55)
+
 
         
         # 3) Lane‐following as before...
@@ -368,4 +452,5 @@ class LaneControllerNode(DTROS):
 
 if __name__ == '__main__':
     node = LaneControllerNode('lane_controller_node')
+    rospy.sleep(0.1)
     rospy.spin()
