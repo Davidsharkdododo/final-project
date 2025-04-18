@@ -133,7 +133,7 @@ class LaneControllerNode(DTROS):
         ]).reshape(3, 3)
         self.red_line_stopped = False
         self.blue_line_stopped = False
-        self.red_line_count = 5
+        self.red_line_count = 0
         # track when we last stopped for a red line
         self.last_red_stop_time = rospy.Time(0)
         self.red_cooldown = rospy.Duration(3)   # 5 seconds of “ignore” time
