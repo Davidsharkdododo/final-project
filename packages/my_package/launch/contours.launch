@@ -1,0 +1,10 @@
+<launch>
+
+  <group ns="$(arg veh)">
+
+    <node pkg="my_package" type="contours.py" name="WhiteContourDebugNode" output="screen">
+    </node>
+
+  </group>
+
+</launch>
