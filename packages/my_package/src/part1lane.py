@@ -420,59 +420,79 @@ class LaneControllerNode(DTROS):
             self.turn_locked_on = True
             rospy.loginfo("locked on")
 
-    def perform_park(self, image, time, radius):
+    def perform_park(self, image, time, tag, radius):
+        # Disable other behaviors while parking
         self.enable_lane_following = False
+        self.enable_red_detection = False
 
-        # initialize on first entry
-        if self.left_turn_start_time is None:
-            self.left_turn_start_time = rospy.Time.now().to_sec()
-            self.init_ticks_left     = self._ticks_left
-            self.init_ticks_right    = self._ticks_right
+        # Initialize on first entry
+        if not hasattr(self, 'park_start_time') or self.park_start_time is None:
+            self.park_start_time = rospy.Time.now().to_sec()
+            self.init_ticks_left = self._ticks_left
+            self.init_ticks_right = self._ticks_right
+            self.straight_drive_active = False
 
-        # how long we’ve been turning
-        elapsed = rospy.Time.now().to_sec() - self.left_turn_start_time
+        # Elapsed time since parking started
+        elapsed = rospy.Time.now().to_sec() - self.park_start_time
 
-        # compute differential‐radius turn correction
-        left_dist   = self._ticks_left  - self.init_ticks_left
-        right_dist  = self._ticks_right - self.init_ticks_right
-        dist_ratio  = (radius - 0.05) / (radius + 0.05)
-        diffr       = abs(left_dist) - abs(right_dist) * dist_ratio
-        corr        = self.tick_pid.compute(diffr)
+        # If time limit reached, force straight-driving phase
+        if elapsed > time and not self.straight_drive_active:
+            rospy.loginfo(f"Time {time}s elapsed; entering straight drive.")
+            self.straight_drive_active = True
 
-        # --- new AprilTag centering logic ---
+        # Compute initial turn speeds based on encoder ticks and fixed radius
+        left_dist  = self._ticks_left  - self.init_ticks_left
+        right_dist = self._ticks_right - self.init_ticks_right
+        dist_ratio = (radius - 0.05) / (radius + 0.05)
+        diff       = abs(left_dist) - abs(right_dist) * dist_ratio
+        corr       = self.tick_pid.compute(diff)
+        base_left  = (0.5 * (radius - 0.05) / radius) - corr
+        base_right = (0.5 * (radius + 0.05) / radius) + corr
+
+        # AprilTag detection for centering and bottom-bound distance
         gray        = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         detections  = self.detector.detect(gray)
         tag_detected = False
-        error_x      = 0.0
+        center_diff = None
+        bottom_diff = None
 
         for det in detections:
-            if det.tag_id == self.target_april_tag:
-                # det.center is (u, v) in pixels
-                u = det.center[0]
-                frame_center = image.shape[1] / 2.0
-                error_x = u - frame_center
+            if det.tag_id == tag:
+                # horizontal centering error
+                xs = det.corners[:, 0]
+                left_px = xs.min()
+                right_px = xs.max()
+                center_diff = abs(left_px - (image.shape[1] - right_px))
+                # vertical bottom-bound distance
+                ys = det.corners[:, 1]
+                bottom_diff = image.shape[0] - ys.max()
                 tag_detected = True
                 break
 
-        if tag_detected:
-            corr_tag = self.tag_pid.compute(error_x)
-        else:
-            corr_tag = 0.0
-        #–––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+        # If centered horizontally (<10px) and within time, switch to straight drive
+        if not self.straight_drive_active and tag_detected and center_diff is not None and center_diff < 10:
+            rospy.loginfo(f"Tag {tag} centered (Δpx={center_diff:.1f}). Entering straight drive.")
+            self.straight_drive_active = True
 
-        # compose wheel speeds: radius‐turn plus AprilTag turn
-        base_left  = (0.5 * (radius - 0.05) / radius)  - corr
-        base_right = (0.5 * (radius + 0.05) / radius)  + corr
-        left_speed  = base_left  - corr_tag
-        right_speed = base_right + corr_tag
+        # Choose speeds: turn until straight drive, else straight
+        if self.straight_drive_active:
+            # Encoder-based straight heading correction
+            tick_error = self._ticks_left - self._ticks_right
+            corr_straight = self.tick_pid.compute(tick_error)
+            left_speed  = 0.4 - corr_straight
+            right_speed = 0.4 + corr_straight
+        else:
+            left_speed  = base_left
+            right_speed = base_right
+
         self.publish_cmd(left_speed, right_speed)
 
-        # finish if either: (a) lane is re‐acquired after time, OR
-        #                   (b) AprilTag is centered within ±10px
-        centered_thresh = 10  # pixels
-        if tag_detected and abs(error_x) < centered_thresh:
-            rospy.loginfo("locked on")
-            self.perform_left_turn(image, 1)
+        # If in straight drive and tag near bottom (<200px), finish parking
+        if self.straight_drive_active and tag_detected and bottom_diff is not None and bottom_diff < 200:
+            rospy.loginfo(f"Tag {tag} close to bottom (Δy={bottom_diff:.1f}px). Parking complete.")
+            self.stop_robot()
+            # invoke system shutdown
+            #os.system("sudo shutdown -h now")
 
 
     def turn_left_45(self):
@@ -579,11 +599,14 @@ class LaneControllerNode(DTROS):
         # elif self.red_line_count == 5 and not self.fourth_line_do_turn and not self.turn_locked_on:
         #     self.perform_left_turn(preprocessed, 0.55)
 
-        elif self.red_line_count == 7 and self.park == 1 or 2:
-            self.perform_park(preprocessed, 1, 0.25)
-        elif self.red_line_count == 7 and self.park == 3 or 4:
-            rospy.loginfo(self.park)
-            self.perform_left_turn(preprocessed, 3, 0.55)    
+        elif self.red_line_count == 7 and self.park == 1:
+            self.perform_park(preprocessed, 1, 44, -0.25)
+        elif self.red_line_count == 7 and self.park == 2:
+            self.perform_park(preprocessed, 1, 58, -0.25)
+        elif self.red_line_count == 7 and self.park == 3:
+            self.perform_park(preprocessed, 2.5, 13, 0.55)   
+        elif self.red_line_count == 7 and self.park == 4:
+            self.perform_park(preprocessed, 2.5 , 47, 0.55)    
 
         # 7) Blue-line phase detection & handling
         if self.enable_blue_phase and (current - self.last_blue_stop_time) > self.blue_cooldown:
