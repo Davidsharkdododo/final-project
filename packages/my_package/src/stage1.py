@@ -101,7 +101,7 @@ class LaneControllerNode(DTROS):
         self.enable_red_detection = True
         self.enable_blue_detection = False
         self.enable_duck_detection = False
-        self.enable_duckblue_detection = False
+        self.enable_duckblue_detection = True
         self.waiting_for_ducks = False
         self.enable_apriltag_detection = True
         self.blue_line_count      = 0
@@ -122,7 +122,7 @@ class LaneControllerNode(DTROS):
         
         # PID controllers
         self.lane_pid = PID(-0.22, 0.01, 0.01, "P", -0.2, 0.3)
-        self.lane_pid_centroid = PID(-0.01, 0.01, 0.01, "P", -0.4, 0.4)
+        self.lane_pid_centroid = PID(-0.01, 0.01, 0.01, "P", -0.4, 0.5)
         self.lane_pid_centroid2 = PID(-0.12, 0.01, 0.01, "P", -0.4, 0.4)
         self.dist_pid = PID(0.06, 0.001, 0.002, "P", -self.base_speed, 0.2)
         self.tick_pid = PID(0.02, 0.001, 0.002, "P", -0.3, 0.3)
@@ -130,9 +130,9 @@ class LaneControllerNode(DTROS):
         self.rotation_pid = PID(0.03, 0.008, 0.01, "PID", -4000, 4000)
         self.tagpark_pid = PID(-0.06, 0.001, 0.003, "P", -0.2, 0.2)
 
-        self.red_line_count = 0
+        self.red_line_count = 5
         self.movements = 0
-        self.park = 2
+        self.park = 3
 
         self.last_time = rospy.Time.now()
         
@@ -657,12 +657,27 @@ class LaneControllerNode(DTROS):
         turn_duration = 0.5  # Duration in seconds (adjust as needed)
         start_time = rospy.Time.now()
         rate = rospy.Rate(50)
-        while rospy.Time.now() - start_time < rospy.Duration(turn_duration):
+        while rospy.Time.now() - start_time < rospy.Duration(1):
+            stop_cmd = WheelsCmdStamped()
+            stop_cmd.header.stamp = rospy.Time.now()
+            stop_cmd.vel_left = 0
+            stop_cmd.vel_right = 0
+            self._publisher.publish(stop_cmd)
+            rate.sleep()
+        while rospy.Time.now() - start_time < rospy.Duration(turn_duration + 1):
             cmd = WheelsCmdStamped()
             cmd.header.stamp = rospy.Time.now()
             # For a left turn: slower left wheel and faster right wheel.
             cmd.vel_left = -0.6
             cmd.vel_right = 0
+            self._publisher.publish(cmd)
+            rate.sleep()
+        while rospy.Time.now() - start_time < rospy.Duration(turn_duration + 2.75):
+            cmd = WheelsCmdStamped()
+            cmd.header.stamp = rospy.Time.now()
+            # For a left turn: slower left wheel and faster right wheel.
+            cmd.vel_left = 0.4
+            cmd.vel_right = 0.4
             self._publisher.publish(cmd)
             rate.sleep()
         # Stop after turn.
@@ -785,6 +800,8 @@ class LaneControllerNode(DTROS):
         undistorted = self.undistort_image(cv_image)
         preprocessed, gray = self.preprocess_image(undistorted)
 
+        # if self.red_line_count == 0:
+        #     self.set_led_color(1,1,1)
         
         # 4) Duck–blue detection (guarded)
         if self.enable_duckblue_detection:
@@ -798,14 +815,14 @@ class LaneControllerNode(DTROS):
                 self.enable_apriltag_detection = False
                 self.tagid = detections[0].tag_id
 
-        if db_detected and self.red_line_count < 4:
-            if self.led_color != "green":
-                self.led_color = "green"
-                self.set_led_color(0, 1, 0)
-        else:
-            if self.led_color != "blue":
-                self.led_color = "blue"
-                self.set_led_color(0, 0, 1)
+        # if db_detected and self.red_line_count < 4:
+        #     if self.led_color != "green":
+        #         self.led_color = "green"
+        #         self.set_led_color(0, 1, 0)
+        # else:
+        #     if self.led_color != "blue":
+        #         self.led_color = "blue"
+        #         self.set_led_color(0, 0, 1)
 
         # 5) Red-line detection & handling
         if self.enable_red_detection and (current - self.last_red_stop_time) > self.red_cooldown:
@@ -849,12 +866,17 @@ class LaneControllerNode(DTROS):
                         self.fourth_line_do_turn = False
 
                 elif self.red_line_count == 5:
+                    self.enable_blue_detection = True
+                    self.enable_duckblue_detection = False
                     self.left_turn_start_time = None
                     self.turn_locked_on = False
                     # disable duck–blue and enter blue-phase
                     
                     # self.enable_blue_phase = True
                     rospy.loginfo("Entering blue-line phase")
+                elif self.red_line_count == 6:
+                    self.left_turn_start_time = None
+                    self.turn_locked_on = False
 
         # 6) Execute any pending red-line turn
         if self.red_line_count == 1 and self.first_line_do_turn and not self.turn_locked_on:
@@ -868,10 +890,8 @@ class LaneControllerNode(DTROS):
             self.perform_left_turn(preprocessed, 0.55)
         elif self.red_line_count == 5 and self.fourth_line_do_turn and not self.turn_locked_on:
             self.enable_blue_phase = True
-            self.enable_blue_detection = True
         elif self.red_line_count == 5 and not self.fourth_line_do_turn and not self.turn_locked_on:
             self.enable_blue_phase = True
-            self.enable_blue_detection = True
             self.perform_left_turn(preprocessed, 0.55)
             
         # elif self.red_line_count == 10 and self.park == 1:
@@ -889,7 +909,7 @@ class LaneControllerNode(DTROS):
                 self.perform_park_lane_following(preprocessed, gray, 44, "right", dt)
             elif self.movements == 1:
                 self.stop_robot()
-                return
+                rospy.signal_shutdown("125/125")
 
         # elif self.red_line_count == 10 and self.park == 2:
         #     self.enable_blue_phase = False
@@ -913,7 +933,7 @@ class LaneControllerNode(DTROS):
                 if self.movements == 1:
                     self.perform_park_lane_following(preprocessed, gray, 58, "left", dt)
                 elif self.movements == 2:
-                    return
+                    rospy.signal_shutdown("125/125")
 
         # elif self.red_line_count == 10 and self.park == 3:
         #     self.enable_blue_phase = False
@@ -932,7 +952,7 @@ class LaneControllerNode(DTROS):
                 if self.movements == 0:
                     self.perform_park_lane_following(preprocessed, gray, 13, "left", dt)
                 elif self.movements == 1:
-                    return
+                    rospy.signal_shutdown("125/125")
 
         # elif self.red_line_count == 10 and self.park == 4:
         #     self.enable_blue_phase = False
@@ -954,7 +974,7 @@ class LaneControllerNode(DTROS):
                 if self.movements == 0:
                     self.perform_park_lane_following(preprocessed, gray, 47, "right", dt)
                 elif self.movements == 1:
-                    return
+                    rospy.signal_shutdown("125/125")
         
 
         # elif self.red_line_count == 6 and self.park == 1:
@@ -1012,7 +1032,7 @@ class LaneControllerNode(DTROS):
             # Handle duckiebot yellow lane timeout
             if self.use_yellow_lane and self.lane_switch_start_time is not None:
                 yellow_lane_elapsed = (current - self.lane_switch_start_time).to_sec()
-                if yellow_lane_elapsed > 4.0:  # 4 second timeout for yellow lane
+                if yellow_lane_elapsed > 2.5:  # 3 second timeout for yellow lane
                     rospy.loginfo("4s elapsed. Switching back to white lane.")
                     self.use_yellow_lane = False
                     self.enable_blue_detection = True
@@ -1061,7 +1081,7 @@ class LaneControllerNode(DTROS):
             # Check for duckiebot in front using duckblue detection
             if self.enable_duckblue_detection:
                 db_detected, db_dist_error, left_dist, right_dist = self.detect_duckblue(undistorted)
-                rospy.loginfo(f"db_detected: {db_detected}, db_dist_error: {db_dist_error}")
+                # rospy.loginfo(f"db_detected: {db_detected}, db_dist_error: {db_dist_error}")
                 
                 # Handle duckiebot detection/avoidance
                 if db_detected and db_dist_error is not None and db_dist_error < 5:  # 15cm threshold for avoidance
@@ -1070,8 +1090,6 @@ class LaneControllerNode(DTROS):
                     # Switch to yellow lane for avoidance
                     if not self.use_yellow_lane:
                         self.enable_duckblue_detection = False
-                        self.stop_robot()
-                        rospy.sleep(0.5)
                         self.turn_left_45()
                         rospy.loginfo("Switching to yellow lane for avoidance")
                         self.use_yellow_lane = True
