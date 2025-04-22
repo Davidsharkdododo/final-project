@@ -76,6 +76,8 @@ class LaneControllerNode(DTROS):
         self.wheels_topic = f"/{self._vehicle_name}/wheels_driver_node/wheels_cmd"
         self._left_encoder_topic = f"/{self._vehicle_name}/left_wheel_encoder_node/tick"
         self._right_encoder_topic = f"/{self._vehicle_name}/right_wheel_encoder_node/tick"
+        self.led_topic = f"/{self._vehicle_name}/led_emitter_node/led_pattern"
+        
 
         self.dist_error = None
         self.first_line_do_turn = None  # track first red line decision
@@ -87,7 +89,7 @@ class LaneControllerNode(DTROS):
         self.dynamic_control_start_time = None
         self.dynamic_control_finished = False
         self.aligning_stopped = False
-        self.park = 1
+        self.park_start_time = None
 
         self._ticks_left = 0
         self._ticks_right = 0
@@ -99,12 +101,16 @@ class LaneControllerNode(DTROS):
         self.enable_red_detection = True
         self.enable_blue_detection = False
         self.enable_duck_detection = False
-        self.enable_duckblue_detection = True
+        self.enable_duckblue_detection = False
         self.waiting_for_ducks = False
+        self.enable_apriltag_detection = True
         self.blue_line_count      = 0
         self.last_blue_stop_time  = rospy.Time(0)
         self.blue_cooldown        = rospy.Duration(10)   # 3 s ignore between blue detections
         self.enable_blue_phase    = False
+        self.tagid = None
+        self.blue_line_ref_ticks = None
+        self.led_color = "blue"
 
         self.last_duckiebot_scan_time = rospy.Time(0)
         
@@ -115,12 +121,19 @@ class LaneControllerNode(DTROS):
         self.base_speed = 0.5
         
         # PID controllers
-        self.lane_pid = PID(-0.22, 0.001, 0.002, "P", -0.2, 0.3)
+        self.lane_pid = PID(-0.22, 0.01, 0.01, "P", -0.2, 0.3)
+        self.lane_pid_centroid = PID(-0.01, 0.01, 0.01, "P", -0.4, 0.4)
+        self.lane_pid_centroid2 = PID(-0.12, 0.01, 0.01, "P", -0.4, 0.4)
         self.dist_pid = PID(0.06, 0.001, 0.002, "P", -self.base_speed, 0.2)
         self.tick_pid = PID(0.02, 0.001, 0.002, "P", -0.3, 0.3)
         self.dynamic_pid = PID(0.055, 0.001, 0.002, "P", -0.3, 0.3)
-        self.rotation_pid = PID(-0.1, 0.001, 0.003, "P", -0.25, 0.25)
-        
+        self.rotation_pid = PID(0.03, 0.008, 0.01, "PID", -4000, 4000)
+        self.tagpark_pid = PID(-0.06, 0.001, 0.003, "P", -0.2, 0.2)
+
+        self.red_line_count = 9
+        self.movements = 0
+        self.park = 3
+
         self.last_time = rospy.Time.now()
         
         # Camera calibration parameters.
@@ -139,8 +152,6 @@ class LaneControllerNode(DTROS):
         ]).reshape(3, 3)
         self.red_line_stopped = False
         self.blue_line_stopped = False
-        self.red_line_count = 9
-        self.movements = 0
         # track when we last stopped for a red line
         self.last_red_stop_time = rospy.Time(0)
         self.red_cooldown = rospy.Duration(3)   # 5 seconds of “ignore” time
@@ -176,6 +187,7 @@ class LaneControllerNode(DTROS):
         self.pub_lane = rospy.Publisher(self.lane_topic, Image, queue_size=15)
         self.debug_gray_topic = f"/{self._vehicle_name}/camera_node/image/compressed/gray"
         self.pub_debug_gray = rospy.Publisher(self.debug_gray_topic, Image, queue_size=1)
+        self._led_pub = rospy.Publisher(self.led_topic, LEDPattern, queue_size=1)
         # self.sub = rospy.Subscriber(self._camera_topic, CompressedImage, self.callback)
         # self.sub_left = rospy.Subscriber(self._left_encoder_topic, WheelEncoderStamped, self.callback_left)
         # self.sub_right = rospy.Subscriber(self._right_encoder_topic, WheelEncoderStamped, self.callback_right)
@@ -250,82 +262,81 @@ class LaneControllerNode(DTROS):
         return duckblue_detected, dist_error, left_dist, right_dist
 
     def detect_lane_fast(self, image):
-        """
-        Fast lane detection using fixed-height scanning.
-        Scans for white pixels in the bottom half of the image.
-        """
-        debug = False
-
-        full_height, width = image.shape[:2]
-        half_height_start = full_height // 2
-        bottom_half = image[half_height_start:full_height, :]
+        scaled_image = cv2.resize(image, (160, 120))
+        bottom_right = scaled_image[80:, 60:]
+        
+        hsv = cv2.cvtColor(bottom_right, cv2.COLOR_BGR2HSV)
+        
+        # Create mask for color
         lane_color = "yellow" if self.use_yellow_lane else "white"
-        hsv = cv2.cvtColor(bottom_half, cv2.COLOR_BGR2HSV)
-        white_mask = cv2.inRange(hsv, self.hsv_ranges[lane_color][0], self.hsv_ranges[lane_color][1])
+        mask = cv2.inRange(hsv, self.hsv_ranges[lane_color][0], self.hsv_ranges[lane_color][1])
         
-        height = full_height - half_height_start
-        center_x = width // 2
+        # Find contours directly on the mask
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Define scan heights.
-        # scan_heights = [int(height * pct) for pct in [0, 0.10, 0.20, 0.40, 0.70]]
-        scan_heights = [int(height * pct) for pct in [0.70, 0.40, 0.20, 0.10, 0]]
-        if debug:
-            output = image.copy()
-            bottom_half_out = output[half_height_start:full_height, :]
-        
-        # base_weights = [0.1, 0.15, 0.2, 0.25, 0.3]
-        base_weights = [0.3, 0.25, 0.2, 0.15, 0.1]
-        offsets = []
-        valid_detections = []
-        
-        for i, y in enumerate(scan_heights):
-            for x in range(center_x, width, 50):
-                if white_mask[y, x] > 0:
-                    for x2 in range(x, x - 50, -5):
-                        if not white_mask[y, x2] > 0:
-                            offsets.append(x2 + 5 - center_x)
-                            valid_detections.append(i)
-                            if debug: cv2.circle(bottom_half_out, (x2, y), 3, (0, 255, 0), -1)                    
-                            break
-                    break
-        
-        error = None
-        if offsets:
-            bottom_idx = valid_detections.index(max(valid_detections))
-            bottom_offset = offsets[bottom_idx]
-            max_deviation = 10  # allowed pixel deviation
-            
-            filtered_offsets = []
-            filtered_detections = []
-            for i, offset in enumerate(offsets):
-                if abs(offset - bottom_offset) <= max_deviation:
-                    filtered_offsets.append(offset)
-                    filtered_detections.append(valid_detections[i])
-                else:
-                    detection_idx = valid_detections[i]
-                    y = scan_heights[detection_idx]
-                    x = center_x + offset
-                    if debug: cv2.circle(bottom_half_out, (x, y), 3, (0, 0, 255), -1)
-                    
-            if filtered_offsets:
-                total_weight = sum([base_weights[i] for i in filtered_detections])
-                normalized_weights = [base_weights[i] / total_weight for i in filtered_detections]
-                weighted_offsets = [filtered_offsets[i] * normalized_weights[i] for i in range(len(filtered_offsets))]
-                error_raw = sum(weighted_offsets)
-                error = error_raw * 0.01 - 1.5
-            
-            if debug:
-                color = (0, 0, 255) if len(valid_detections) < 3 else (0, 255, 0)
-                cv2.putText(bottom_half_out, f"{len(valid_detections)}/5 pts, err:{error:.3f}", 
-                            (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-                debug_img_msg = self.bridge.cv2_to_imgmsg(bottom_half_out, encoding="bgr8")
-                debug_img_msg.header.stamp = rospy.Time.now()
-                self.pub_lane.publish(debug_img_msg)
-        else:
-            error = 10
-            # rospy.loginfo("error is none")
-        
+        # Process results
+        if not contours: 
+            # rospy.loginfo("not contours")
+            return 1000
+        largest_contour = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest_contour) < 50: 
+            # rospy.loginfo("cv2.contourArea(largest_contour) < 50:")
+            return 1000
+        M = cv2.moments(largest_contour)
+        if M['m00'] == 0:
+            # rospy.loginfo("M['m00'] == 0")
+            return 1000
+        cx = int(M['m10'] / M['m00'])
+
+        # rospy.loginfo(f"centroid: {cx} | M20x: {M['m20']} | M02y: {M['m02']}")
+        # rospy.loginfo(f"centroid: {cx}")
+
+        error = cx - 80
+
         return error
+    
+    def detect_lane_fast_wide(self, image, side):
+        scaled_image = cv2.resize(image, (160, 120))
+        if side == "left":
+            bottom_left = scaled_image[80:, :60]
+            hsv = cv2.cvtColor(bottom_left, cv2.COLOR_BGR2HSV)
+        elif side == "right":
+            bottom_right = scaled_image[80:, 60:]
+            hsv = cv2.cvtColor(bottom_right, cv2.COLOR_BGR2HSV)
+    
+        
+        # Create mask for color
+        lane_color = "yellow" if self.use_yellow_lane else "white"
+        mask = cv2.inRange(hsv, self.hsv_ranges[lane_color][0], self.hsv_ranges[lane_color][1])
+        
+        # Find contours directly on the mask
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Process results
+        if not contours: 
+            # rospy.loginfo("not contours")
+            return 1000
+        largest_contour = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest_contour) < 50: 
+            # rospy.loginfo("cv2.contourArea(largest_contour) < 50:")
+            return 1000
+        M = cv2.moments(largest_contour)
+        if M['m00'] == 0:
+            # rospy.loginfo("M['m00'] == 0")
+            return 1000
+        cx = int(M['m10'] / M['m00'])
+
+        # rospy.loginfo(f"centroid: {cx} | M20x: {M['m20']} | M02y: {M['m02']}")
+        # rospy.loginfo(f"centroid: {cx}")
+        if side == "left":
+            error = cx - 10
+        elif side == "right":
+            error = cx - 75
+
+        # rospy.loginfo(f"error: {error}")
+
+        return error
+
 
     def detect_red_line(self, image):
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -370,7 +381,7 @@ class LaneControllerNode(DTROS):
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
         
-        # Define ray starting points (20px left and right of center)
+        # Define ray starting points (15px left and right of center)
         left_x = cx - 15
         right_x = cx + 15
         
@@ -400,14 +411,14 @@ class LaneControllerNode(DTROS):
             y_diff = left_y - right_y
             # Convert y_diff to angle (approximation)
             # tan(angle) ≈ y_diff / x_diff, where x_diff is 40 pixels
-            angle = np.degrees(np.arctan2(y_diff, 40))
+            angle = np.degrees(np.arctan2(y_diff, 30))
             
             # rospy.loginfo(f"Red line angle: {angle:.2f}° (y_diff: {y_diff})")
             return angle
         else:
             return None
         
-    def align_with_red_line(self, image):
+    def align_with_red_line(self, image, dt):
         """
         Rotates the Duckiebot to align with a red line (make the line horizontal).
         Uses the detect_red_line_angle function to get the current angle and 
@@ -425,25 +436,26 @@ class LaneControllerNode(DTROS):
             return False
         
         # Check if we're already aligned (within threshold)
-        if abs(angle) < 1.0:  # 1 degree threshold for alignment
+        if abs(angle) < 1:  # 1 degree threshold for alignment
             rospy.loginfo("Red line aligned (angle: %.2f)", angle)
             self.stop_robot()
             self.aligning_stopped = True
+            self.movements += 1
         
         # Calculate rotation correction using PID controller
         # Note: You'll need to add your own PID controller for this (e.g., self.rotation_pid)
-        rotation_correction = self.rotation_pid.compute(angle)
+        rotation_correction = self.rotation_pid.compute(angle, dt)
         
         # Apply the rotation_correction to refine the rotation speed
-        if angle < 0: 
-            left_speed = rotation_correction
-            right_speed = 0
-        else: 
-            left_speed = 0
-            right_speed = -rotation_correction
+
+        left_speed = 0
+        right_speed = rotation_correction
+
 
         
         # Publish wheel commands
+        rospy.loginfo(f"Left: {left_speed}, Right: {right_speed}")
+
         self.publish_cmd(left_speed, right_speed)
     
     def detect_blue_line(self, image):
@@ -495,36 +507,107 @@ class LaneControllerNode(DTROS):
         cmd.header.stamp = rospy.Time.now()
         cmd.vel_left = 0.0
         cmd.vel_right = 0.0
+        # rospy.loginfo("stop_robot")
         self._publisher.publish(cmd)
 
-    def perform_left_turn(self, image, radius):
+    def perform_left_turn(self, image, radius = None, time = 3):
         self.enable_lane_following = False
         self.enable_red_detection = False
         if self.left_turn_start_time is None: 
             self.left_turn_start_time = rospy.Time.now().to_sec()
             self.init_ticks_left = self._ticks_left
             self.init_ticks_right = self._ticks_right
-
-
-        dist_ratio = (radius - 0.05) / (radius + 0.05)
-
         left_dist = self._ticks_left - self.init_ticks_left
         right_dist = self._ticks_right - self.init_ticks_right
-        
-        diff = abs(left_dist) - abs(right_dist)*dist_ratio
 
-        corr = self.tick_pid.compute(diff)
+        if radius is not None:
+            dist_ratio = (radius - 0.05) / (radius + 0.05)
+            
+            diffr = abs(left_dist) - abs(right_dist)*dist_ratio
 
-        # rospy.loginfo(f"diff: {diff} corr: {corr}")
+            corr = self.tick_pid.compute(diffr)
 
-        self.publish_cmd((0.5 * (radius - 0.05) / radius) - corr, (0.5 * (radius + 0.05) / radius) + corr)
+            # rospy.loginfo(f"diff: {diff} corr: {corr}")
 
+            self.publish_cmd((0.5 * (radius - 0.05) / radius) - corr, (0.5 * (radius + 0.05) / radius) + corr)
+        else:
+            diffs = abs(left_dist) - abs(right_dist)
+            corrs = self.tick_pid.compute(diffs)
+
+            self.publish_cmd(0.4 - corrs, 0.4 + corrs)
 
         lane_error = self.detect_lane_fast(image)
         # rospy.loginfo(lane_error)
-        if abs(lane_error) < 0.5 and rospy.Time.now().to_sec() - self.left_turn_start_time > 3:
+        if abs(lane_error) < 20 and rospy.Time.now().to_sec() - self.left_turn_start_time > time:
             self.enable_lane_following = True
             self.enable_red_detection = True
+            self.turn_locked_on = True
+            rospy.loginfo("locked on")
+
+    def perform_left_turn_park(self, image, side, radius = None, time = 3):
+        self.enable_lane_following = False
+        self.enable_red_detection = False
+        if self.left_turn_start_time is None: 
+            self.left_turn_start_time = rospy.Time.now().to_sec()
+            self.init_ticks_left = self._ticks_left
+            self.init_ticks_right = self._ticks_right
+        left_dist = self._ticks_left - self.init_ticks_left
+        right_dist = self._ticks_right - self.init_ticks_right
+
+        if radius is not None:
+            dist_ratio = (radius - 0.05) / (radius + 0.05)
+            
+            diffr = abs(left_dist) - abs(right_dist)*dist_ratio
+
+            corr = self.tick_pid.compute(diffr)
+
+            # rospy.loginfo(f"diff: {diff} corr: {corr}")
+
+            self.publish_cmd((0.5 * (radius - 0.05) / radius) - corr, (0.5 * (radius + 0.05) / radius) + corr)
+        else:
+            diffs = abs(left_dist) - abs(right_dist)
+            corrs = self.tick_pid.compute(diffs)
+
+            self.publish_cmd(0.4 - corrs, 0.4 + corrs)
+
+        lane_error = self.detect_lane_fast_wide(image, side)
+        # rospy.loginfo(lane_error)
+        if abs(lane_error) < 10 and rospy.Time.now().to_sec() - self.left_turn_start_time > time:
+            self.turn_locked_on = True
+            rospy.loginfo("locked on")
+
+    def perform_left_turn_apriltag(self, gray, tag, radius = None):
+        self.enable_lane_following = False
+        self.enable_red_detection = False
+        if self.left_turn_start_time is None: 
+            self.left_turn_start_time = rospy.Time.now().to_sec()
+            self.init_ticks_left = self._ticks_left
+            self.init_ticks_right = self._ticks_right
+        left_dist = self._ticks_left - self.init_ticks_left
+        right_dist = self._ticks_right - self.init_ticks_right
+
+        if radius is not None:
+            dist_ratio = (radius - 0.05) / (radius + 0.05)
+            
+            diffr = abs(left_dist) - abs(right_dist)*dist_ratio
+
+            corr = self.tick_pid.compute(diffr)
+
+            # rospy.loginfo(f"diff: {diff} corr: {corr}")
+
+            self.publish_cmd((0.5 * (radius - 0.05) / radius) - corr, (0.5 * (radius + 0.05) / radius) + corr)
+
+            detections  = self.detector.detect(gray)
+            center_diff = None
+
+            for det in detections:
+                if det.tag_id == tag:
+                    tag_center_x = det.center[0]            
+                    center_diff = tag_center_x - 320
+                    break
+
+        # rospy.loginfo(lane_error)
+        if center_diff and abs(center_diff) < 50:
             self.turn_locked_on = True
             rospy.loginfo("locked on")
 
@@ -589,6 +672,105 @@ class LaneControllerNode(DTROS):
         stop_cmd.vel_right = 0
         self._publisher.publish(stop_cmd)
 
+
+    def perform_park(self, gray, tag):
+        # Disable other behaviors while parking
+        self.enable_lane_following = False
+        self.enable_red_detection = False
+
+        # Initialize on first entry
+        if self.park_start_time is None:
+            self.park_start_time = rospy.Time.now().to_sec()
+
+        # Elapsed time since parking started
+        elapsed = rospy.Time.now().to_sec() - self.park_start_time
+
+        # AprilTag detection for centering and bottom-bound distance
+        detections  = self.detector.detect(gray)
+        tag_detected = False
+        center_diff = None
+        bottom_diff = None
+
+        for det in detections:
+            if det.tag_id == tag:
+                tag_center_x = det.center[0]
+                tag_center_y = det.center[1]                
+                center_diff = tag_center_x - 320
+                bottom_diff = 480 - tag_center_y
+                
+                tag_detected = True
+                break
+
+        if tag_detected: 
+            corr = self.tagpark_pid.compute(center_diff)
+            self.publish_cmd(0.3 - corr, 0.3 + corr)
+        else:
+            self.publish_cmd(-0.3, 0.3)
+        
+
+        # If in straight drive and tag near bottom (<200px), finish parking
+        if tag_detected and bottom_diff is not None and bottom_diff < 250:
+            rospy.loginfo(f"Tag {tag} close to bottom (Δy={bottom_diff:.1f}px). Parking complete.")
+            self.movements += 1
+            self.stop_robot()
+            # invoke system shutdown
+            #os.system("sudo shutdown -h now")
+
+    def perform_park_lane_following(self, image, gray, tag, side, dt):
+        self.enable_lane_following = False
+        self.enable_red_detection = False
+        # Initialize on first entry
+        if self.park_start_time is None:
+            self.park_start_time = rospy.Time.now().to_sec()
+
+        # Elapsed time since parking started
+        elapsed = rospy.Time.now().to_sec() - self.park_start_time
+
+        # AprilTag detection for centering and bottom-bound distance
+        detections  = self.detector.detect(gray)
+        error = self.detect_lane_fast_wide(image, side)
+        lane_corr = self.lane_pid_centroid.compute(error, dt)
+        tag_detected = False
+        center_diff = None
+        bottom_diff = None
+
+        for det in detections:
+            if det.tag_id == tag:
+                tag_center_x = det.center[0]
+                tag_center_y = det.center[1]                
+                center_diff = tag_center_x - 320
+                bottom_diff = 480 - tag_center_y
+                
+                tag_detected = True
+                break
+            
+        
+        self.publish_cmd(0.4 - lane_corr, 0.4 + lane_corr)
+        
+
+        # If in straight drive and tag near bottom (<200px), finish parking
+        if tag_detected and bottom_diff is not None and bottom_diff < 260:
+            rospy.loginfo(f"Tag {tag} close to bottom (Δy={bottom_diff:.1f}px). Parking complete.")
+            self.movements += 1
+            self.stop_robot()
+            # invoke system shutdown
+            #os.system("sudo shutdown -h now")
+
+    def set_led_color(self, r, g, b):
+        num_leds = 5  # Most Duckiebots have 5 LEDs. Adjust if yours differs!
+
+        pattern_msg = LEDPattern()
+        pattern_msg.header.stamp = rospy.Time.now()
+
+        color_msg = ColorRGBA()
+        color_msg.r = r
+        color_msg.g = g
+        color_msg.b = b
+        color_msg.a = 1
+        pattern_msg.rgb_vals = [color_msg] * num_leds
+        # Publish
+        self._led_pub.publish(pattern_msg)
+
     def callback(self, msg, left_encoder_msg, right_encoder_msg):
         # 1) Update encoder readings and timing
         self._ticks_left = left_encoder_msg.data
@@ -603,11 +785,27 @@ class LaneControllerNode(DTROS):
         undistorted = self.undistort_image(cv_image)
         preprocessed, gray = self.preprocess_image(undistorted)
 
-
+        
         # 4) Duck–blue detection (guarded)
         if self.enable_duckblue_detection:
             db_detected, self.dist_error, left_dist, right_dist = self.detect_duckblue(undistorted)
-        else:db_detected, self.dist_error, left_dist, right_dist = None, None, None, None
+        else:
+            db_detected, self.dist_error, left_dist, right_dist = None, None, None, None
+
+        if self.red_line_count == 3 and self.enable_apriltag_detection:
+            detections = self.detector.detect(gray)
+            if detections:
+                self.enable_apriltag_detection = False
+                self.tagid = detections[0].tag_id
+
+        if db_detected and self.red_line_count < 4:
+            if self.led_color != "green":
+                self.led_color = "green"
+                self.set_led_color(0, 1, 0)
+        else:
+            if self.led_color != "blue":
+                self.led_color = "blue"
+                self.set_led_color(0, 0, 1)
 
         # 5) Red-line detection & handling
         if self.enable_red_detection and (current - self.last_red_stop_time) > self.red_cooldown:
@@ -618,28 +816,34 @@ class LaneControllerNode(DTROS):
                 self.red_line_count += 1
                 rospy.loginfo(f"red line count: {self.red_line_count}")
                 self.stop_robot()
+                if self.red_line_count == 1: rospy.sleep(1)
                 rospy.sleep(0.5)
                 if self.red_line_count < 5:
                     dot_detection_active = False
                 # per-line decisions
                 if self.red_line_count == 1:
+                    _, _, left_dist, right_dist = self.detect_duckblue(undistorted)
+                    rospy.loginfo(f"left_dist: {left_dist}, right_dist: {right_dist}")
                     if left_dist is not None and right_dist is not None:
                         if left_dist > right_dist + 10:
                             self.first_line_do_turn = False
                         else:
                             rospy.loginfo("Turning left")
                             self.first_line_do_turn = True
+                elif self.red_line_count == 2:
+                    self.left_turn_start_time = None
+                    self.turn_locked_on = False
 
                 elif self.red_line_count == 3:
                     self.left_turn_start_time = None
                     self.turn_locked_on = False
+                    
 
                 elif self.red_line_count == 4:
                     self.left_turn_start_time = None
                     self.turn_locked_on = False
                     # april-tag logic
-                    detections = self.detector.detect(gray)
-                    if detections and detections[0].tag_id == 48:
+                    if self.tagid and self.tagid == 48:
                         self.fourth_line_do_turn = True
                     else:
                         self.fourth_line_do_turn = False
@@ -649,54 +853,151 @@ class LaneControllerNode(DTROS):
                     self.turn_locked_on = False
                     # disable duck–blue and enter blue-phase
                     
-                    self.enable_blue_phase = True
+                    # self.enable_blue_phase = True
                     rospy.loginfo("Entering blue-line phase")
-
-                    
 
         # 6) Execute any pending red-line turn
         if self.red_line_count == 1 and self.first_line_do_turn and not self.turn_locked_on:
             self.perform_left_turn(preprocessed, 0.55)
+        elif self.red_line_count == 2 and self.first_line_do_turn and not self.turn_locked_on:
+            self.perform_left_turn(preprocessed, None, 2)
         elif self.red_line_count == 3 and not self.first_line_do_turn and not self.turn_locked_on:
             self.perform_left_turn(preprocessed, 0.55)
         elif self.red_line_count == 4 and self.fourth_line_do_turn and not self.turn_locked_on:
-            self.perform_left_turn(preprocessed, 0.55)
-        elif self.red_line_count == 5:
             self.enable_duckblue_detection = False
-        # elif self.red_line_count == 5 and not self.fourth_line_do_turn and not self.turn_locked_on:
-        #     self.perform_left_turn(preprocessed, 0.55)
+            self.perform_left_turn(preprocessed, 0.55)
+        elif self.red_line_count == 5 and self.fourth_line_do_turn and not self.turn_locked_on:
+            self.enable_blue_phase = True
+            self.enable_blue_detection = True
+        elif self.red_line_count == 5 and not self.fourth_line_do_turn and not self.turn_locked_on:
+            self.enable_blue_phase = True
+            self.enable_blue_detection = True
+            self.perform_left_turn(preprocessed, 0.55)
+            
+        # elif self.red_line_count == 10 and self.park == 1:
+        #     self.enable_blue_phase = False
+        #     if self.turn_locked_on is False:
+        #         self.perform_left_turn_apriltag(gray, 44, -0.45)
+        #     else:
+        #         if self.movements == 1:
+        #             return
+        #         self.perform_park(gray, 44)
 
         elif self.red_line_count == 10 and self.park == 1:
+            self.enable_blue_phase = False
             if self.movements == 0:
-                self.dynamic_control(0.48, 0.36, 5)
+                self.perform_park_lane_following(preprocessed, gray, 44, "right", dt)
             elif self.movements == 1:
                 self.stop_robot()
-        
+                return
+
+        # elif self.red_line_count == 10 and self.park == 2:
+        #     self.enable_blue_phase = False
+        #     if self.movements == 0:
+        #         self.dynamic_control(0.2, 0.2, 5)
+        #     if self.movements == 1:
+        #         if self.turn_locked_on is False:
+        #             self.perform_left_turn_apriltag(gray, 58, -0.45)
+        #         else:
+        #             if self.movements == 2:
+        #                 return
+        #             self.perform_park(gray, 58)
+
         elif self.red_line_count == 10 and self.park == 2:
+            self.enable_blue_phase = False
             if self.movements == 0:
-                self.dynamic_control(0.25, 0.25, 5)
-            elif self.movements == 1:
-                self.dynamic_control(0.48, 0.36, 5)
-            elif self.movements == 2:
-                self.stop_robot()
+                self.dynamic_control(0.35, 0.35, 5)
+            elif self.turn_locked_on is False and self.movements == 1:
+                self.perform_left_turn_park(preprocessed, "left", -0.35, 0.5)
+            else:
+                if self.movements == 1:
+                    self.perform_park_lane_following(preprocessed, gray, 58, "left", dt)
+                elif self.movements == 2:
+                    return
+
+        # elif self.red_line_count == 10 and self.park == 3:
+        #     self.enable_blue_phase = False
+        #     if self.turn_locked_on is False:
+        #         self.perform_left_turn_apriltag(gray, 13, 0.45)
+        #     else:
+        #         if self.movements == 1:
+        #             return
+        #         self.perform_park(gray, 13)
 
         elif self.red_line_count == 10 and self.park == 3:
-            if self.movements == 0:
-                self.dynamic_control(0.36, 0.48, 5)
-            elif self.movements == 1:
-                self.dynamic_control(0.4, 0.4, 5)
-            elif self.movements == 2:
-                self.stop_robot()
+            self.enable_blue_phase = False
+            if self.turn_locked_on is False:
+                self.perform_left_turn_park(preprocessed, "left", 0.3, 2)
+            else:
+                if self.movements == 0:
+                    self.perform_park_lane_following(preprocessed, gray, 13, "left", dt)
+                elif self.movements == 1:
+                    return
+
+        # elif self.red_line_count == 10 and self.park == 4:
+        #     self.enable_blue_phase = False
+        #     if self.movements == 0:
+        #         self.dynamic_control(0.2, 0.2, 5)
+        #     if self.movements == 1:
+        #         if self.turn_locked_on is False:
+        #             self.perform_left_turn_apriltag(gray, 47, 0.45)
+        #         else:
+        #             if self.movements == 2:
+        #                 return
+        #             self.perform_park(gray, 47)
 
         elif self.red_line_count == 10 and self.park == 4:
-            if self.movements == 0:
-                self.dynamic_control(0.25, 0.25, 5)
-            elif self.movements == 1:
-                self.dynamic_control(0.36, 0.48, 5)
-            elif self.movements == 2:
-                self.dynamic_control(0.4, 0.4, 5)
-            elif self.movements == 3:
-                self.stop_robot()
+            self.enable_blue_phase = False
+            if self.turn_locked_on is False:
+                self.perform_left_turn_park(preprocessed, "right", 0.6, 2)
+            else:
+                if self.movements == 0:
+                    self.perform_park_lane_following(preprocessed, gray, 47, "right", dt)
+                elif self.movements == 1:
+                    return
+        
+
+        # elif self.red_line_count == 6 and self.park == 1:
+        #     self.enable_blue_phase = False
+        #     if self.movements == 0:
+        #         self.align_with_red_line(preprocessed, dt)
+        #     elif self.movements == 1:
+        #         self.dynamic_control(0.025, 0.025, 5)
+        #     elif self.movements == 2:
+        #         self.dynamic_control(0.48, 0.36, 5)
+        #     elif self.movements == 3:
+        #         self.perform_park(gray, 44, 5)
+        #     elif self.movements == 4:
+        #         self.stop_robot()
+        
+        # elif self.red_line_count == 6 and self.park == 2:
+        #     self.enable_blue_phase = False
+        #     if self.movements == 0:
+        #         self.dynamic_control(0.25, 0.25, 5)
+        #     elif self.movements == 1:
+        #         self.dynamic_control(0.48, 0.36, 5)
+        #     elif self.movements == 2:
+        #         self.stop_robot()
+
+        # elif self.red_line_count == 6 and self.park == 3:
+        #     self.enable_blue_phase = False
+        #     if self.movements == 0:
+        #         self.dynamic_control(0.36, 0.48, 5)
+        #     elif self.movements == 1:
+        #         self.dynamic_control(0.4, 0.4, 5)
+        #     elif self.movements == 2:
+        #         self.stop_robot()
+
+        # elif self.red_line_count == 6 and self.park == 4:
+        #     self.enable_blue_phase = False
+        #     if self.movements == 0:
+        #         self.dynamic_control(0.25, 0.25, 5)
+        #     elif self.movements == 1:
+        #         self.dynamic_control(0.36, 0.48, 5)
+        #     elif self.movements == 2:
+        #         self.dynamic_control(0.4, 0.4, 5)
+        #     elif self.movements == 3:
+        #         self.stop_robot()
 
 
 
@@ -704,91 +1005,94 @@ class LaneControllerNode(DTROS):
             self.enable_lane_following = False
             self.enable_red_detection = False
             self.align_with_red_line(preprocessed)
-        else:
-            self.stop_robot()
 
 
         # 7) Blue-line phase detection & handling
-        if self.enable_blue_phase and (current - self.last_blue_stop_time) > self.blue_cooldown:
-            blue_detected, blue_dist = self.detect_blue_line(preprocessed)
-            if blue_detected and blue_dist is not None and blue_dist < 0.15:
-                self.last_blue_stop_time = current
-                self.blue_line_count += 1
-                rospy.loginfo(f"blue line #{self.blue_line_count}")
-
-                # on 1st and 3rd blue lines: stop, wait, then start duck-wait
-                if self.blue_line_count in (1, 2):
-                    self.stop_robot()
-                    rospy.sleep(2)
-                    self.waiting_for_ducks = True
-
-        if self.waiting_for_ducks:
-            duck_present, _ = self.detect_duck(undistorted)
-            rospy.loginfo(duck_present)
-            if duck_present:
-                self.stop_robot()
-                return
-            else:
-                self.waiting_for_ducks = False
-                rospy.loginfo("Duck gone, resuming lane-following")            
-        dot_detection_active = False 
-
-        if self.red_line_count >= 5: 
-            if self.lane_switch_start_time is not None:
-                elapsed_since_switch = current - self.lane_switch_start_time
-
-                # after 3 s put lane colour back to white
-                if elapsed_since_switch >= rospy.Duration(3.0) and self.use_yellow_lane:
-                    rospy.loginfo("3s elapsed. Switching back to white lane.")
+        if self.enable_blue_phase:
+            # Handle duckiebot yellow lane timeout
+            if self.use_yellow_lane and self.lane_switch_start_time is not None:
+                yellow_lane_elapsed = (current - self.lane_switch_start_time).to_sec()
+                if yellow_lane_elapsed > 4.0:  # 4 second timeout for yellow lane
+                    rospy.loginfo("4s elapsed. Switching back to white lane.")
                     self.use_yellow_lane = False
-
-                # keep dot detection OFF while we are in the cooldown window
-                if elapsed_since_switch < self.lane_switch_cooldown:
-                    dot_detection_active = False
-                else:                                     # cooldown finished
+                    self.enable_blue_detection = True
                     self.lane_switch_start_time = None
-                    dot_detection_active = True
-            else:
-                # no cooldown in progress → we may run dot detection
-                dot_detection_active = True
+            
+            # Check for blue line detection (only when enabled)
+            if self.enable_blue_detection:
+                blue_detected, blue_dist = self.detect_blue_line(preprocessed)
+                if blue_detected and blue_dist is not None and blue_dist < 0.15:
+                    self.blue_line_count += 1
+                    rospy.loginfo(f"blue line #{self.blue_line_count}")
+                    
+                    # On first blue line: stop, wait, then start duck-wait
+                    if self.blue_line_count in (1, 2):
+                        self.stop_robot()
+                        rospy.sleep(1)
+                        self.waiting_for_ducks = True
+                        self.enable_blue_detection = False  # Disable blue detection to ignore the second blue line
+                        self.blue_line_ref_ticks = self._ticks_left  # Store reference encoder value
+                        # Initially disable duckiebot detection until we pass the duck
+                        self.enable_duckblue_detection = False
+                        rospy.loginfo(f"First blue line detected at ticks {self.blue_line_ref_ticks}, waiting for ducks")
+            
+            # Handle duck detection and waiting
+            if self.waiting_for_ducks:
+                duck_present, _ = self.detect_duck(undistorted)
+                if duck_present:
+                    self.stop_robot()
+                    rospy.loginfo("Duck detected, waiting...")
+                    return
+                else:
+                    rospy.loginfo("Duck gone, resuming lane-following")
+                    self.waiting_for_ducks = False
+                    # Continue driving but keep blue detection off until we've moved enough
+            
+            # Check if we've moved enough ticks since detecting blue line
+            if not self.enable_blue_detection and self.blue_line_ref_ticks is not None:
+                ticks_moved = abs(self._ticks_left - self.blue_line_ref_ticks)
+                
+                # Re-enable duckiebot detection if we've moved enough ticks (250)
+                if ticks_moved > 250 and not self.enable_duckblue_detection:
+                    rospy.loginfo(f"Moved {ticks_moved} ticks since blue line, enabling duckiebot detection")
+                    self.enable_duckblue_detection = True
+                    self.blue_line_ref_ticks = None
+            
+            # Check for duckiebot in front using duckblue detection
+            if self.enable_duckblue_detection:
+                db_detected, db_dist_error, left_dist, right_dist = self.detect_duckblue(undistorted)
+                rospy.loginfo(f"db_detected: {db_detected}, db_dist_error: {db_dist_error}")
+                
+                # Handle duckiebot detection/avoidance
+                if db_detected and db_dist_error is not None and db_dist_error < 5:  # 15cm threshold for avoidance
+                    rospy.loginfo("Duckiebot detected at < 15cm, initiating avoidance")
+                    
+                    # Switch to yellow lane for avoidance
+                    if not self.use_yellow_lane:
+                        self.enable_duckblue_detection = False
+                        self.stop_robot()
+                        rospy.sleep(0.5)
+                        self.turn_left_45()
+                        rospy.loginfo("Switching to yellow lane for avoidance")
+                        self.use_yellow_lane = True
+                        self.lane_switch_start_time = rospy.Time.now()
+                    
+                    # Continue with lane following using yellow lane detection
+                    return
+                
 
-
-         # --- Duckiebot detection logic ---
-        if dot_detection_active:
-            (detection, centers) = cv2.findCirclesGrid(
-                undistorted,
-                patternSize=tuple(self.circlepattern_dims),
-                flags=cv2.CALIB_CB_SYMMETRIC_GRID,
-                blobDetector=self.simple_blob_detector,
-            )
-            if detection > 0 and centers is not None and centers.shape[0] >= 2:
-                dot0 = centers[0, 0]
-                dot1 = centers[1, 0]
-                distance_dots = np.linalg.norm(dot0 - dot1)
-                rospy.loginfo("Distance between first two dots: %.2f pixels", distance_dots)
-                # Trigger lane switch if distance exceeds threshold.
-                if distance_dots > 9:
-                    rospy.loginfo("Distance > 13 detected. Stopping for 3 seconds, turning left 45°, and switching lane detection.")
-                    stop_cmd = WheelsCmdStamped()
-                    stop_cmd.header.stamp = rospy.Time.now()
-                    stop_cmd.vel_left = 0
-                    stop_cmd.vel_right = 0
-                    self._publisher.publish(stop_cmd)
-                    rospy.sleep(1)
-                    # Turn left 45 degrees.
-                    self.turn_left_45()
-                    # Immediately switch lane detection to yellow.
-                    self.use_yellow_lane = True
-                    self.lane_switch_start_time = rospy.Time.now()
+        
         # 8) Normal lane-following
         if self.enable_lane_following:
             lane_error = self.detect_lane_fast(preprocessed)
             dist_corr = self.dist_pid.compute(self.dist_error, dt) if self.dist_error is not None else None
             
             if lane_error is not None:
-                lane_corr = self.lane_pid.compute(lane_error, dt)
+                lane_corr = self.lane_pid_centroid.compute(lane_error, dt)
                 ls, rs = self.combine_error(lane_corr, dist_corr)
                 self.publish_cmd(ls, rs)
+
+        self.detect_lane_fast_wide(preprocessed, "left")
 
 
 
