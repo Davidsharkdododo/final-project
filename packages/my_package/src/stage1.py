@@ -130,9 +130,9 @@ class LaneControllerNode(DTROS):
         self.rotation_pid = PID(0.03, 0.008, 0.01, "PID", -4000, 4000)
         self.tagpark_pid = PID(-0.06, 0.001, 0.003, "P", -0.2, 0.2)
 
-        self.red_line_count = 9
+        self.red_line_count = 0
         self.movements = 0
-        self.park = 3
+        self.park = 2
 
         self.last_time = rospy.Time.now()
         
@@ -883,7 +883,7 @@ class LaneControllerNode(DTROS):
         #             return
         #         self.perform_park(gray, 44)
 
-        elif self.red_line_count == 10 and self.park == 1:
+        elif self.red_line_count == 6 and self.park == 1:
             self.enable_blue_phase = False
             if self.movements == 0:
                 self.perform_park_lane_following(preprocessed, gray, 44, "right", dt)
@@ -903,7 +903,7 @@ class LaneControllerNode(DTROS):
         #                 return
         #             self.perform_park(gray, 58)
 
-        elif self.red_line_count == 10 and self.park == 2:
+        elif self.red_line_count == 6 and self.park == 2:
             self.enable_blue_phase = False
             if self.movements == 0:
                 self.dynamic_control(0.35, 0.35, 5)
@@ -924,7 +924,7 @@ class LaneControllerNode(DTROS):
         #             return
         #         self.perform_park(gray, 13)
 
-        elif self.red_line_count == 10 and self.park == 3:
+        elif self.red_line_count == 6 and self.park == 3:
             self.enable_blue_phase = False
             if self.turn_locked_on is False:
                 self.perform_left_turn_park(preprocessed, "left", 0.3, 2)
@@ -946,7 +946,7 @@ class LaneControllerNode(DTROS):
         #                 return
         #             self.perform_park(gray, 47)
 
-        elif self.red_line_count == 10 and self.park == 4:
+        elif self.red_line_count == 6 and self.park == 4:
             self.enable_blue_phase = False
             if self.turn_locked_on is False:
                 self.perform_left_turn_park(preprocessed, "right", 0.6, 2)
